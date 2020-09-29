@@ -35,12 +35,14 @@ pub mod benches;
 pub mod kovan;
 pub mod rialto;
 
+mod millau;
+
 use pallet_grandpa::{fg_primitives, AuthorityId as GrandpaId, AuthorityList as GrandpaAuthorityList};
 use sp_api::impl_runtime_apis;
 use sp_consensus_aura::sr25519::AuthorityId as AuraId;
 use sp_core::{crypto::KeyTypeId, OpaqueMetadata};
 use sp_runtime::traits::{
-	BlakeTwo256, Block as BlockT, IdentifyAccount, IdentityLookup, NumberFor, OpaqueKeys, Saturating, Verify,
+	BlakeTwo256, Block as BlockT, IdentityLookup, NumberFor, OpaqueKeys, Saturating,
 };
 use sp_runtime::{
 	create_runtime_str, generic, impl_opaque_keys,
@@ -73,18 +75,18 @@ pub use sp_runtime::{Perbill, Permill};
 pub type BlockNumber = bp_rialto::BlockNumber;
 
 /// Alias to 512-bit hash when used in the context of a transaction signature on the chain.
-pub type Signature = MultiSignature;
+pub type Signature = bp_rialto::Signature;
 
 /// Some way of identifying an account on the chain. We intentionally make it equivalent
 /// to the public key of our transaction signing scheme.
-pub type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::AccountId;
+pub type AccountId = bp_rialto::AccountId;
 
 /// The type for looking up accounts. We don't expect more than 4 billion of them, but you
 /// never know...
 pub type AccountIndex = u32;
 
 /// Balance of an account.
-pub type Balance = u128;
+pub type Balance = bp_rialto::Balance;
 
 /// Index of a transaction in the chain.
 pub type Index = u32;
@@ -416,6 +418,34 @@ impl pallet_session::Trait for Runtime {
 
 impl pallet_shift_session_manager::Trait for Runtime {}
 
+parameter_types! {
+	pub const MaxMessagesToPruneAtOnce: bp_message_lane::MessageNonce = 8;
+	pub const MaxUnconfirmedMessagesAtInboundLane: bp_message_lane::MessageNonce = 16;
+}
+
+impl pallet_message_lane::Trait for Runtime {
+	type Event = Event;
+	type MaxMessagesToPruneAtOnce = MaxMessagesToPruneAtOnce;
+	type MaxUnconfirmedMessagesAtInboundLane = MaxUnconfirmedMessagesAtInboundLane;
+
+	type OutboundPayload = crate::millau::ToMillauMessagePayload;
+	type OutboundMessageFee = Balance;
+
+	type InboundPayload = crate::millau::FromMillauMessagePayload;
+	type InboundMessageFee = bp_millau::Balance;
+	type InboundRelayer = bp_millau::AccountId;
+
+	type TargetHeaderChain = crate::millau::Millau;
+	type LaneMessageVerifier = crate::millau::Millau;
+	type MessageDeliveryAndDispatchPayment = pallet_message_lane::instant_payments::InstantCurrencyPayments<
+		AccountId,
+		pallet_balances::Module<Runtime>,
+	>;
+
+	type SourceHeaderChain = crate::millau::Millau;
+	type MessageDispatch = crate::millau::FromMillauMessageDispatch;
+}
+
 construct_runtime!(
 	pub enum Runtime where
 		Block = Block,
@@ -427,6 +457,7 @@ construct_runtime!(
 		BridgeRialtoCurrencyExchange: pallet_bridge_currency_exchange::<Instance1>::{Module, Call},
 		BridgeKovanCurrencyExchange: pallet_bridge_currency_exchange::<Instance2>::{Module, Call},
 		BridgeCallDispatch: pallet_bridge_call_dispatch::{Module, Event<T>},
+		BridgeMillauMessageLane: pallet_message_lane::{Module, Call, Event<T>},
 		System: frame_system::{Module, Call, Config, Storage, Event<T>},
 		RandomnessCollectiveFlip: pallet_randomness_collective_flip::{Module, Call, Storage},
 		Timestamp: pallet_timestamp::{Module, Call, Storage, Inherent},

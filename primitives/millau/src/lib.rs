@@ -20,6 +20,7 @@
 // Runtime-generated DecodeLimit::decode_all_With_depth_limit
 #![allow(clippy::unnecessary_mut_passed)]
 
+use sp_runtime::{MultiSignature, MultiSigner, traits::{IdentifyAccount, Verify}};
 use sp_std::prelude::*;
 
 /// Block number type used in Millau.
@@ -27,6 +28,19 @@ pub type BlockNumber = u32;
 
 /// Hash type used in Millau.
 pub type Hash = sp_core::H256;
+
+/// Alias to 512-bit hash when used in the context of a transaction signature on the chain.
+pub type Signature = MultiSignature;
+
+/// Some way of identifying an account on the chain. We intentionally make it equivalent
+/// to the public key of our transaction signing scheme.
+pub type AccountId = <<Signature as Verify>::Signer as IdentifyAccount>::AccountId;
+
+/// Public key of the chain account that may be used to verify signatures.
+pub type AccountSigner = MultiSigner;
+
+/// Balance of an account.
+pub type Balance = u128;
 
 sp_api::decl_runtime_apis! {
 	/// API for querying information about Millau headers from the Bridge Pallet instance.

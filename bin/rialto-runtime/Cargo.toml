@@ -8,8 +8,10 @@ repository = "https://github.com/paritytech/parity-bridges-common/"
 license = "GPL-3.0-or-later WITH Classpath-exception-2.0"
 
 [dependencies]
+bp-message-dispatch = { path = "../../primitives/message-dispatch", default-features = false }
 bp-millau = { path = "../../primitives/millau", default-features = false }
 bp-rialto = { path = "../../primitives/rialto", default-features = false }
+bp-runtime = { path = "../../primitives/runtime", default-features = false }
 hex-literal = "0.3"
 
 [dependencies.codec]
@@ -200,6 +202,12 @@ tag = 'v2.0.0'
 default-features = false
 git = "https://github.com/paritytech/substrate/"
 
+[dependencies.sp-trie]
+version = "2.0.0"
+tag = 'v2.0.0'
+default-features = false
+git = "https://github.com/paritytech/substrate/"
+
 [dependencies.sp-version]
 version = "2.0.0"
 tag = 'v2.0.0'
@@ -257,9 +265,11 @@ default = ["std"]
 std = [
 	"bp-currency-exchange/std",
 	"bp-eth-poa/std",
+	"bp-message-dispatch/std",
 	"bp-message-lane/std",
 	"bp-millau/std",
 	"bp-rialto/std",
+	"bp-runtime/std",
 	"codec/std",
 	"frame-benchmarking/std",
 	"frame-executive/std",
@@ -289,6 +299,7 @@ std = [
 	"sp-session/std",
 	"sp-std/std",
 	"sp-transaction-pool/std",
+	"sp-trie/std",
 	"sp-version/std",
 ]
 runtime-benchmarks = [

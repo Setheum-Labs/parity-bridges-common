@@ -722,6 +722,7 @@ version = "0.1.0"
 dependencies = [
  "sp-api",
  "sp-core",
+ "sp-runtime",
  "sp-std",
 ]
 
@@ -731,6 +732,7 @@ version = "0.1.0"
 dependencies = [
  "sp-api",
  "sp-core",
+ "sp-runtime",
  "sp-std",
 ]
 
@@ -5291,9 +5293,11 @@ dependencies = [
  "bp-currency-exchange",
  "bp-eth-poa",
  "bp-header-chain",
+ "bp-message-dispatch",
  "bp-message-lane",
  "bp-millau",
  "bp-rialto",
+ "bp-runtime",
  "frame-benchmarking",
  "frame-executive",
  "frame-support",
@@ -5328,6 +5332,7 @@ dependencies = [
  "sp-staking",
  "sp-std",
  "sp-transaction-pool",
+ "sp-trie",
  "sp-version",
  "substrate-wasm-builder-runner",
 ]
