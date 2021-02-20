@@ -16,7 +16,7 @@
 
 use crate::error::Error;
 use crate::validators::{Validators, ValidatorsConfiguration};
-use crate::{AuraConfiguration, ImportContext, PoolConfiguration, ScheduledChange, Storage};
+use crate::{AuraConfiguration, AuraScheduledChange, ChainTime, ImportContext, PoolConfiguration, Storage};
 use bp_eth_poa::{
 	public_to_address, step_validator, Address, AuraHeader, HeaderId, Receipt, SealedEmptyStep, H256, H520, U128, U256,
 };
@@ -46,19 +46,20 @@ pub fn is_importable_header<S: Storage>(storage: &S, header: &AuraHeader) -> Res
 /// Try accept unsigned aura header into transaction pool.
 ///
 /// Returns required and provided tags.
-pub fn accept_aura_header_into_pool<S: Storage>(
+pub fn accept_aura_header_into_pool<S: Storage, CT: ChainTime>(
 	storage: &S,
 	config: &AuraConfiguration,
 	validators_config: &ValidatorsConfiguration,
 	pool_config: &PoolConfiguration,
 	header: &AuraHeader,
+	chain_time: &CT,
 	receipts: Option<&Vec<Receipt>>,
 ) -> Result<(Vec<TransactionTag>, Vec<TransactionTag>), Error> {
 	// check if we can verify further
 	let (header_id, _) = is_importable_header(storage, header)?;
 
 	// we can always do contextless checks
-	contextless_checks(config, header)?;
+	contextless_checks(config, header, chain_time)?;
 
 	// we want to avoid having same headers twice in the pool
 	// => we're strict about receipts here - if we need them, we require receipts to be Some,
@@ -153,14 +154,15 @@ pub fn accept_aura_header_into_pool<S: Storage>(
 }
 
 /// Verify header by Aura rules.
-pub fn verify_aura_header<S: Storage>(
+pub fn verify_aura_header<S: Storage, CT: ChainTime>(
 	storage: &S,
 	config: &AuraConfiguration,
 	submitter: Option<S::Submitter>,
 	header: &AuraHeader,
+	chain_time: &CT,
 ) -> Result<ImportContext<S::Submitter>, Error> {
 	// let's do the lightest check first
-	contextless_checks(config, header)?;
+	contextless_checks(config, header, chain_time)?;
 
 	// the rest of checks requires access to the parent header
 	let context = storage.import_context(submitter, &header.parent_hash).ok_or_else(|| {
@@ -180,7 +182,11 @@ pub fn verify_aura_header<S: Storage>(
 }
 
 /// Perform basic checks that only require header itself.
-fn contextless_checks(config: &AuraConfiguration, header: &AuraHeader) -> Result<(), Error> {
+fn contextless_checks<CT: ChainTime>(
+	config: &AuraConfiguration,
+	header: &AuraHeader,
+	chain_time: &CT,
+) -> Result<(), Error> {
 	let expected_seal_fields = expected_header_seal_fields(config, header);
 	if header.seal.len() != expected_seal_fields {
 		return Err(Error::InvalidSealArity);
@@ -207,6 +213,10 @@ fn contextless_checks(config: &AuraConfiguration, header: &AuraHeader) -> Result
 		return Err(Error::TimestampOverflow);
 	}
 
+	if chain_time.is_timestamp_ahead(header.timestamp) {
+		return Err(Error::HeaderTimestampIsAhead);
+	}
+
 	Ok(())
 }
 
@@ -222,7 +232,11 @@ fn contextual_checks<Submitter>(
 	let parent_step = context.parent_header().step().ok_or(Error::MissingStep)?;
 
 	// Ensure header is from the step after context.
-	if header_step == parent_step || (header.number >= config.validate_step_transition && header_step <= parent_step) {
+	if header_step == parent_step {
+		return Err(Error::DoubleVote);
+	}
+	#[allow(clippy::suspicious_operation_groupings)]
+	if header.number >= config.validate_step_transition && header_step < parent_step {
 		return Err(Error::DoubleVote);
 	}
 
@@ -331,7 +345,7 @@ fn find_next_validators_signal<S: Storage>(storage: &S, context: &ImportContext<
 	// if parent schedules validators set change, then it may be our set
 	// else we'll start with last known change
 	let mut current_set_signal_block = context.last_signal_block();
-	let mut next_scheduled_set: Option<ScheduledChange> = None;
+	let mut next_scheduled_set: Option<AuraScheduledChange> = None;
 
 	loop {
 		// if we have reached block that signals finalized change, then
@@ -358,7 +372,7 @@ mod tests {
 	use super::*;
 	use crate::mock::{
 		insert_header, run_test_with_genesis, test_aura_config, validator, validator_address, validators_addresses,
-		validators_change_receipt, AccountId, HeaderBuilder, TestRuntime, GAS_LIMIT,
+		validators_change_receipt, AccountId, ConstChainTime, HeaderBuilder, TestRuntime, GAS_LIMIT,
 	};
 	use crate::validators::ValidatorsSource;
 	use crate::DefaultInstance;
@@ -366,8 +380,9 @@ mod tests {
 		pool_configuration, BridgeStorage, FinalizedBlock, Headers, HeadersByNumber, NextValidatorsSetId,
 		ScheduledChanges, ValidatorsSet, ValidatorsSets,
 	};
-	use bp_eth_poa::{compute_merkle_root, rlp_encode, TransactionOutcome, H520};
+	use bp_eth_poa::{compute_merkle_root, rlp_encode, TransactionOutcome, H520, U256};
 	use frame_support::{StorageMap, StorageValue};
+	use hex_literal::hex;
 	use secp256k1::SecretKey;
 	use sp_runtime::transaction_validity::TransactionTag;
 
@@ -381,7 +396,7 @@ mod tests {
 	fn verify_with_config(config: &AuraConfiguration, header: &AuraHeader) -> Result<ImportContext<AccountId>, Error> {
 		run_test_with_genesis(genesis(), TOTAL_VALIDATORS, |_| {
 			let storage = BridgeStorage::<TestRuntime>::new();
-			verify_aura_header(&storage, &config, None, header)
+			verify_aura_header(&storage, &config, None, header, &ConstChainTime::default())
 		})
 	}
 
@@ -414,6 +429,7 @@ mod tests {
 				&validators_config,
 				&pool_configuration(),
 				&header,
+				&(),
 				receipts.as_ref(),
 			)
 		})
@@ -444,7 +460,7 @@ mod tests {
 			});
 			ScheduledChanges::<DefaultInstance>::insert(
 				header.header.parent_hash,
-				ScheduledChange {
+				AuraScheduledChange {
 					validators: signalled_set,
 					prev_signal_block: None,
 				},
@@ -555,6 +571,50 @@ mod tests {
 	}
 
 	#[test]
+	fn verifies_chain_time() {
+		// expected import context after verification
+		let expect = ImportContext::<AccountId> {
+			submitter: None,
+			parent_hash: hex!("6e41bff05578fc1db17f6816117969b07d2217f1f9039d8116a82764335991d3").into(),
+			parent_header: genesis(),
+			parent_total_difficulty: U256::zero(),
+			parent_scheduled_change: None,
+			validators_set_id: 0,
+			validators_set: ValidatorsSet {
+				validators: vec![
+					hex!("dc5b20847f43d67928f49cd4f85d696b5a7617b5").into(),
+					hex!("897df33a7b3c62ade01e22c13d48f98124b4480f").into(),
+					hex!("05c987b34c6ef74e0c7e69c6e641120c24164c2d").into(),
+				],
+				signal_block: None,
+				enact_block: HeaderId {
+					number: 0,
+					hash: hex!("6e41bff05578fc1db17f6816117969b07d2217f1f9039d8116a82764335991d3").into(),
+				},
+			},
+			last_signal_block: None,
+		};
+
+		// header is behind
+		let header = HeaderBuilder::with_parent(&genesis())
+			.timestamp(i32::max_value() as u64 / 2 - 100)
+			.sign_by(&validator(1));
+		assert_eq!(default_verify(&header).unwrap(), expect);
+
+		// header is ahead
+		let header = HeaderBuilder::with_parent(&genesis())
+			.timestamp(i32::max_value() as u64 / 2 + 100)
+			.sign_by(&validator(1));
+		assert_eq!(default_verify(&header), Err(Error::HeaderTimestampIsAhead));
+
+		// header has same timestamp as ConstChainTime
+		let header = HeaderBuilder::with_parent(&genesis())
+			.timestamp(i32::max_value() as u64 / 2)
+			.sign_by(&validator(1));
+		assert_eq!(default_verify(&header).unwrap(), expect);
+	}
+
+	#[test]
 	fn verifies_parent_existence() {
 		// when there's no parent in the storage
 		let header = HeaderBuilder::with_number(1).sign_by(&validator(0));
@@ -577,11 +637,11 @@ mod tests {
 		assert_eq!(default_verify(&header), Err(Error::MissingStep));
 
 		// when step is the same as for the parent block
-		header.seal[0] = rlp_encode(&42u64);
+		header.seal[0] = rlp_encode(&42u64).to_vec();
 		assert_eq!(default_verify(&header), Err(Error::DoubleVote));
 
 		// when step is OK
-		header.seal[0] = rlp_encode(&43u64);
+		header.seal[0] = rlp_encode(&43u64).to_vec();
 		assert_ne!(default_verify(&header), Err(Error::DoubleVote));
 
 		// now check with validate_step check enabled
@@ -589,12 +649,12 @@ mod tests {
 		config.validate_step_transition = 0;
 
 		// when step is lesser that for the parent block
-		header.seal[0] = rlp_encode(&40u64);
+		header.seal[0] = rlp_encode(&40u64).to_vec();
 		header.seal = vec![vec![40], vec![]];
 		assert_eq!(verify_with_config(&config, &header), Err(Error::DoubleVote));
 
 		// when step is OK
-		header.seal[0] = rlp_encode(&44u64);
+		header.seal[0] = rlp_encode(&44u64).to_vec();
 		assert_ne!(verify_with_config(&config, &header), Err(Error::DoubleVote));
 	}
 
@@ -660,7 +720,7 @@ mod tests {
 
 		// when header signature is invalid
 		let mut header = good_header.clone();
-		header.seal[1] = rlp_encode(&H520::default());
+		header.seal[1] = rlp_encode(&H520::default()).to_vec();
 		assert_eq!(default_verify(&header), Err(Error::NotValidator));
 
 		// when everything is OK

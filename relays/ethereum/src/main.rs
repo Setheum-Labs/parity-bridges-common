@@ -34,8 +34,8 @@ use ethereum_sync_loop::EthereumSyncParams;
 use headers_relay::sync::TargetTransactionMode;
 use hex_literal::hex;
 use instances::{BridgeInstance, Kovan, RialtoPoA};
-use parity_crypto::publickey::{KeyPair, Secret};
-use relay_utils::metrics::MetricsParams;
+use relay_utils::{initialize::initialize_relay, metrics::MetricsParams};
+use secp256k1::SecretKey;
 use sp_core::crypto::Pair;
 use substrate_sync_loop::SubstrateSyncParams;
 
@@ -43,10 +43,10 @@ use headers_relay::sync::HeadersSyncParams;
 use relay_ethereum_client::{ConnectionParams as EthereumConnectionParams, SigningParams as EthereumSigningParams};
 use relay_rialto_client::SigningParams as RialtoSigningParams;
 use relay_substrate_client::ConnectionParams as SubstrateConnectionParams;
-use std::{io::Write, sync::Arc};
+use std::sync::Arc;
 
 fn main() {
-	initialize();
+	initialize_relay();
 
 	let yaml = clap::load_yaml!("cli.yml");
 	let matches = clap::App::from_yaml(yaml).get_matches();
@@ -63,7 +63,6 @@ fn main() {
 			.is_err()
 			{
 				log::error!(target: "bridge", "Unable to get Substrate genesis block for Ethereum sync.");
-				return;
 			};
 		}
 		("sub-to-eth", Some(sub_to_eth_matches)) => {
@@ -78,7 +77,6 @@ fn main() {
 			.is_err()
 			{
 				log::error!(target: "bridge", "Unable to get Substrate genesis block for Substrate sync.");
-				return;
 			};
 		}
 		("eth-deploy-contract", Some(eth_deploy_matches)) => {
@@ -118,43 +116,6 @@ fn main() {
 	}
 }
 
-fn initialize() {
-	let mut builder = env_logger::Builder::new();
-
-	let filters = match std::env::var("RUST_LOG") {
-		Ok(env_filters) => format!("bridge=info,{}", env_filters),
-		Err(_) => "bridge=info".into(),
-	};
-
-	builder.parse_filters(&filters);
-	builder.format(move |buf, record| {
-		writeln!(buf, "{}", {
-			let timestamp = time::OffsetDateTime::now_local().format("%Y-%m-%d %H:%M:%S %z");
-			if cfg!(windows) {
-				format!("{} {} {} {}", timestamp, record.level(), record.target(), record.args())
-			} else {
-				use ansi_term::Colour as Color;
-				let log_level = match record.level() {
-					log::Level::Error => Color::Fixed(9).bold().paint(record.level().to_string()),
-					log::Level::Warn => Color::Fixed(11).bold().paint(record.level().to_string()),
-					log::Level::Info => Color::Fixed(10).paint(record.level().to_string()),
-					log::Level::Debug => Color::Fixed(14).paint(record.level().to_string()),
-					log::Level::Trace => Color::Fixed(12).paint(record.level().to_string()),
-				};
-				format!(
-					"{} {} {} {}",
-					Color::Fixed(8).bold().paint(timestamp),
-					log_level,
-					Color::Fixed(8).paint(record.target()),
-					record.args()
-				)
-			}
-		})
-	});
-
-	builder.init();
-}
-
 fn ethereum_connection_params(matches: &clap::ArgMatches) -> Result<EthereumConnectionParams, String> {
 	let mut params = EthereumConnectionParams::default();
 	if let Some(eth_host) = matches.value_of("eth-host") {
@@ -171,10 +132,9 @@ fn ethereum_connection_params(matches: &clap::ArgMatches) -> Result<EthereumConn
 fn ethereum_signing_params(matches: &clap::ArgMatches) -> Result<EthereumSigningParams, String> {
 	let mut params = EthereumSigningParams::default();
 	if let Some(eth_signer) = matches.value_of("eth-signer") {
-		params.signer = eth_signer
-			.parse::<Secret>()
-			.map_err(|e| format!("Failed to parse eth-signer: {}", e))
-			.and_then(|secret| KeyPair::from_secret(secret).map_err(|e| format!("Invalid eth-signer: {}", e)))?;
+		params.signer =
+			SecretKey::parse_slice(&hex::decode(eth_signer).map_err(|e| format!("Failed to parse eth-signer: {}", e))?)
+				.map_err(|e| format!("Invalid eth-signer: {}", e))?;
 	}
 	if let Some(eth_chain_id) = matches.value_of("eth-chain-id") {
 		params.chain_id = eth_chain_id
@@ -432,5 +392,18 @@ fn parse_hex_argument(matches: &clap::ArgMatches, arg: &str) -> Result<Option<Ve
 			hex::decode(value).map_err(|e| format!("Failed to parse {}: {}", arg, e))?,
 		)),
 		None => Ok(None),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+
+	// Details: https://github.com/paritytech/parity-bridges-common/issues/118
+	#[test]
+	fn async_std_sleep_works() {
+		let mut local_pool = futures::executor::LocalPool::new();
+		local_pool.run_until(async move {
+			async_std::task::sleep(std::time::Duration::from_secs(1)).await;
+		});
 	}
 }

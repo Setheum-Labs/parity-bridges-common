@@ -18,7 +18,9 @@
 //! So we are giving runtime opportunity to prepare environment and construct proof
 //! before invoking module calls.
 
-use super::{BaseHeaderChain, Call, Instance, Module as CurrencyExchangeModule, Trait as CurrencyExchangeTrait};
+use super::{
+	Call, Config as CurrencyExchangeConfig, InclusionProofVerifier, Instance, Module as CurrencyExchangeModule,
+};
 use sp_std::prelude::*;
 
 use frame_benchmarking::{account, benchmarks_instance};
@@ -29,7 +31,7 @@ const WORST_TX_SIZE_FACTOR: u32 = 1000;
 const WORST_PROOF_SIZE_FACTOR: u32 = 1000;
 
 /// Module we're benchmarking here.
-pub struct Module<T: Trait<I>, I: Instance>(CurrencyExchangeModule<T, I>);
+pub struct Module<T: Config<I>, I: Instance>(CurrencyExchangeModule<T, I>);
 
 /// Proof benchmarking parameters.
 pub struct ProofParams<Recipient> {
@@ -45,17 +47,15 @@ pub struct ProofParams<Recipient> {
 	pub proof_size_factor: u32,
 }
 
-/// Trait that must be implemented by runtime.
-pub trait Trait<I: Instance>: CurrencyExchangeTrait<I> {
+/// Config that must be implemented by runtime.
+pub trait Config<I: Instance>: CurrencyExchangeConfig<I> {
 	/// Prepare proof for importing exchange transaction.
 	fn make_proof(
 		proof_params: ProofParams<Self::AccountId>,
-	) -> <<Self as CurrencyExchangeTrait<I>>::PeerBlockchain as BaseHeaderChain>::TransactionInclusionProof;
+	) -> <<Self as CurrencyExchangeConfig<I>>::PeerBlockchain as InclusionProofVerifier>::TransactionInclusionProof;
 }
 
 benchmarks_instance! {
-	_ { }
-
 	// Benchmark `import_peer_transaction` extrinsic with the best possible conditions:
 	// * Proof is the transaction itself.
 	// * Transaction has minimal size.

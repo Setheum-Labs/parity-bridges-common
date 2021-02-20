@@ -34,7 +34,7 @@ targets = [
 # The path where the advisory database is cloned/fetched into
 db-path = "~/.cargo/advisory-db"
 # The url of the advisory database to use
-db-url = "https://github.com/rustsec/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
 # The lint level for security vulnerabilities
 vulnerability = "deny"
 # The lint level for unmaintained crates
@@ -49,7 +49,16 @@ notice = "warn"
 # output a note when they are encountered.
 ignore = [
 	# yaml-rust < clap. Not feasible to upgrade and also not possible to trigger in practice.
-	"RUSTSEC-2018-0006"
+	"RUSTSEC-2018-0006",
+	# We need to wait until Substrate updates their `wasmtime` dependency to fix this.
+	# TODO: See issue #676: https://github.com/paritytech/parity-bridges-common/issues/676
+	"RUSTSEC-2021-0013",
+	# We need to wait until Substrate updates their `libp2p` dependency to fix this.
+	# TODO: See issue #681: https://github.com/paritytech/parity-bridges-common/issues/681
+	"RUSTSEC-2020-0123",
+	# We need to wait until Substrate updates their `hyper` dependency to fix this.
+	# TODO: See issue #710: https://github.com/paritytech/parity-bridges-common/issues/681
+	"RUSTSEC-2021-0020",
 ]
 # Threshold for security vulnerabilities, any vulnerability with a CVSS score
 # lower than the range specified will be ignored. Note that ignored advisories

@@ -27,7 +27,54 @@ pub const MAX_BACKOFF_INTERVAL: Duration = Duration::from_secs(60);
 /// reconnection again.
 pub const CONNECTION_ERROR_DELAY: Duration = Duration::from_secs(10);
 
+pub mod initialize;
 pub mod metrics;
+pub mod relay_loop;
+
+/// Block number traits shared by all chains that relay is able to serve.
+pub trait BlockNumberBase:
+	'static
+	+ From<u32>
+	+ Into<u64>
+	+ Ord
+	+ Clone
+	+ Copy
+	+ Default
+	+ Send
+	+ Sync
+	+ std::fmt::Debug
+	+ std::fmt::Display
+	+ std::hash::Hash
+	+ std::ops::Add<Output = Self>
+	+ std::ops::Sub<Output = Self>
+	+ num_traits::CheckedSub
+	+ num_traits::Saturating
+	+ num_traits::Zero
+	+ num_traits::One
+{
+}
+
+impl<T> BlockNumberBase for T where
+	T: 'static
+		+ From<u32>
+		+ Into<u64>
+		+ Ord
+		+ Clone
+		+ Copy
+		+ Default
+		+ Send
+		+ Sync
+		+ std::fmt::Debug
+		+ std::fmt::Display
+		+ std::hash::Hash
+		+ std::ops::Add<Output = Self>
+		+ std::ops::Sub<Output = Self>
+		+ num_traits::CheckedSub
+		+ num_traits::Saturating
+		+ num_traits::Zero
+		+ num_traits::One
+{
+}
 
 /// Macro that returns (client, Err(error)) tuple from function if result is Err(error).
 #[macro_export]
@@ -36,7 +83,7 @@ macro_rules! bail_on_error {
 		match $result {
 			(client, Ok(result)) => (client, result),
 			(client, Err(error)) => return (client, Err(error)),
-			}
+		}
 	};
 }
 
@@ -47,7 +94,7 @@ macro_rules! bail_on_arg_error {
 		match $result {
 			Ok(result) => result,
 			Err(error) => return ($client, Err(error)),
-			}
+		}
 	};
 }
 
@@ -101,11 +148,12 @@ impl ToString for StringifiedMaybeConnectionError {
 
 /// Exponential backoff for connection-unrelated errors retries.
 pub fn retry_backoff() -> ExponentialBackoff {
-	let mut backoff = ExponentialBackoff::default();
-	// we do not want relayer to stop
-	backoff.max_elapsed_time = None;
-	backoff.max_interval = MAX_BACKOFF_INTERVAL;
-	backoff
+	ExponentialBackoff {
+		// we do not want relayer to stop
+		max_elapsed_time: None,
+		max_interval: MAX_BACKOFF_INTERVAL,
+		..Default::default()
+	}
 }
 
 /// Compact format of IDs vector.

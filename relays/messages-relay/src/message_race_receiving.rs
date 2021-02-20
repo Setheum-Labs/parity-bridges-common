@@ -18,21 +18,25 @@ use crate::message_lane_loop::{
 	SourceClient as MessageLaneSourceClient, SourceClientState, TargetClient as MessageLaneTargetClient,
 	TargetClientState,
 };
-use crate::message_race_delivery::DeliveryStrategy;
-use crate::message_race_loop::{MessageRace, SourceClient, TargetClient};
+use crate::message_race_loop::{
+	MessageRace, NoncesRange, SourceClient, SourceClientNonces, TargetClient, TargetClientNonces,
+};
+use crate::message_race_strategy::BasicStrategy;
+use crate::metrics::MessageLaneLoopMetrics;
 
 use async_trait::async_trait;
+use bp_message_lane::MessageNonce;
 use futures::stream::FusedStream;
 use relay_utils::FailedClient;
 use std::{marker::PhantomData, ops::RangeInclusive, time::Duration};
 
 /// Message receiving confirmations delivery strategy.
-type ReceivingConfirmationsDeliveryStrategy<P> = DeliveryStrategy<
+type ReceivingConfirmationsBasicStrategy<P> = BasicStrategy<
 	<P as MessageLane>::TargetHeaderNumber,
 	<P as MessageLane>::TargetHeaderHash,
 	<P as MessageLane>::SourceHeaderNumber,
 	<P as MessageLane>::SourceHeaderHash,
-	<P as MessageLane>::MessageNonce,
+	RangeInclusive<MessageNonce>,
 	<P as MessageLane>::MessagesReceivingProof,
 >;
 
@@ -43,20 +47,23 @@ pub async fn run<P: MessageLane>(
 	target_client: impl MessageLaneTargetClient<P>,
 	target_state_updates: impl FusedStream<Item = TargetClientState<P>>,
 	stall_timeout: Duration,
+	metrics_msg: Option<MessageLaneLoopMetrics>,
 ) -> Result<(), FailedClient> {
 	crate::message_race_loop::run(
 		ReceivingConfirmationsRaceSource {
 			client: target_client,
+			metrics_msg: metrics_msg.clone(),
 			_phantom: Default::default(),
 		},
 		target_state_updates,
 		ReceivingConfirmationsRaceTarget {
 			client: source_client,
+			metrics_msg,
 			_phantom: Default::default(),
 		},
 		source_state_updates,
 		stall_timeout,
-		ReceivingConfirmationsDeliveryStrategy::<P>::new(std::u32::MAX.into()),
+		ReceivingConfirmationsBasicStrategy::<P>::new(),
 	)
 	.await
 }
@@ -68,47 +75,63 @@ impl<P: MessageLane> MessageRace for ReceivingConfirmationsRace<P> {
 	type SourceHeaderId = TargetHeaderIdOf<P>;
 	type TargetHeaderId = SourceHeaderIdOf<P>;
 
-	type MessageNonce = P::MessageNonce;
+	type MessageNonce = MessageNonce;
 	type Proof = P::MessagesReceivingProof;
 
 	fn source_name() -> String {
-		format!("{}::ReceivingConfirmationsDelivery", P::SOURCE_NAME)
+		format!("{}::ReceivingConfirmationsDelivery", P::TARGET_NAME)
 	}
 
 	fn target_name() -> String {
-		format!("{}::ReceivingConfirmationsDelivery", P::TARGET_NAME)
+		format!("{}::ReceivingConfirmationsDelivery", P::SOURCE_NAME)
 	}
 }
 
 /// Message receiving confirmations race source, which is a target of the lane.
 struct ReceivingConfirmationsRaceSource<P: MessageLane, C> {
 	client: C,
+	metrics_msg: Option<MessageLaneLoopMetrics>,
 	_phantom: PhantomData<P>,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<P, C> SourceClient<ReceivingConfirmationsRace<P>> for ReceivingConfirmationsRaceSource<P, C>
 where
 	P: MessageLane,
 	C: MessageLaneTargetClient<P>,
 {
 	type Error = C::Error;
+	type NoncesRange = RangeInclusive<MessageNonce>;
+	type ProofParameters = ();
 
-	async fn latest_nonce(
+	async fn nonces(
 		&self,
 		at_block: TargetHeaderIdOf<P>,
-	) -> Result<(TargetHeaderIdOf<P>, P::MessageNonce), Self::Error> {
-		self.client.latest_received_nonce(at_block).await
+		prev_latest_nonce: MessageNonce,
+	) -> Result<(TargetHeaderIdOf<P>, SourceClientNonces<Self::NoncesRange>), Self::Error> {
+		let (at_block, latest_received_nonce) = self.client.latest_received_nonce(at_block).await?;
+		if let Some(metrics_msg) = self.metrics_msg.as_ref() {
+			metrics_msg.update_target_latest_received_nonce::<P>(latest_received_nonce);
+		}
+		Ok((
+			at_block,
+			SourceClientNonces {
+				new_nonces: prev_latest_nonce + 1..=latest_received_nonce,
+				confirmed_nonce: None,
+			},
+		))
 	}
 
+	#[allow(clippy::unit_arg)]
 	async fn generate_proof(
 		&self,
 		at_block: TargetHeaderIdOf<P>,
-		nonces: RangeInclusive<P::MessageNonce>,
+		nonces: RangeInclusive<MessageNonce>,
+		_proof_parameters: Self::ProofParameters,
 	) -> Result<
 		(
 			TargetHeaderIdOf<P>,
-			RangeInclusive<P::MessageNonce>,
+			RangeInclusive<MessageNonce>,
 			P::MessagesReceivingProof,
 		),
 		Self::Error,
@@ -123,32 +146,87 @@ where
 /// Message receiving confirmations race target, which is a source of the lane.
 struct ReceivingConfirmationsRaceTarget<P: MessageLane, C> {
 	client: C,
+	metrics_msg: Option<MessageLaneLoopMetrics>,
 	_phantom: PhantomData<P>,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<P, C> TargetClient<ReceivingConfirmationsRace<P>> for ReceivingConfirmationsRaceTarget<P, C>
 where
 	P: MessageLane,
 	C: MessageLaneSourceClient<P>,
 {
 	type Error = C::Error;
+	type TargetNoncesData = ();
 
-	async fn latest_nonce(
+	async fn nonces(
 		&self,
 		at_block: SourceHeaderIdOf<P>,
-	) -> Result<(SourceHeaderIdOf<P>, P::MessageNonce), Self::Error> {
-		self.client.latest_confirmed_received_nonce(at_block).await
+		update_metrics: bool,
+	) -> Result<(SourceHeaderIdOf<P>, TargetClientNonces<()>), Self::Error> {
+		let (at_block, latest_confirmed_nonce) = self.client.latest_confirmed_received_nonce(at_block).await?;
+		if update_metrics {
+			if let Some(metrics_msg) = self.metrics_msg.as_ref() {
+				metrics_msg.update_source_latest_confirmed_nonce::<P>(latest_confirmed_nonce);
+			}
+		}
+		Ok((
+			at_block,
+			TargetClientNonces {
+				latest_nonce: latest_confirmed_nonce,
+				nonces_data: (),
+			},
+		))
 	}
 
 	async fn submit_proof(
 		&self,
 		generated_at_block: TargetHeaderIdOf<P>,
-		_nonces: RangeInclusive<P::MessageNonce>,
+		nonces: RangeInclusive<MessageNonce>,
 		proof: P::MessagesReceivingProof,
-	) -> Result<RangeInclusive<P::MessageNonce>, Self::Error> {
+	) -> Result<RangeInclusive<MessageNonce>, Self::Error> {
 		self.client
 			.submit_messages_receiving_proof(generated_at_block, proof)
-			.await
+			.await?;
+		Ok(nonces)
+	}
+}
+
+impl NoncesRange for RangeInclusive<MessageNonce> {
+	fn begin(&self) -> MessageNonce {
+		*RangeInclusive::<MessageNonce>::start(self)
+	}
+
+	fn end(&self) -> MessageNonce {
+		*RangeInclusive::<MessageNonce>::end(self)
+	}
+
+	fn greater_than(self, nonce: MessageNonce) -> Option<Self> {
+		let next_nonce = nonce + 1;
+		let end = *self.end();
+		if next_nonce > end {
+			None
+		} else {
+			Some(std::cmp::max(self.begin(), next_nonce)..=end)
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn range_inclusive_works_as_nonces_range() {
+		let range = 20..=30;
+
+		assert_eq!(NoncesRange::begin(&range), 20);
+		assert_eq!(NoncesRange::end(&range), 30);
+		assert_eq!(range.clone().greater_than(10), Some(20..=30));
+		assert_eq!(range.clone().greater_than(19), Some(20..=30));
+		assert_eq!(range.clone().greater_than(20), Some(21..=30));
+		assert_eq!(range.clone().greater_than(25), Some(26..=30));
+		assert_eq!(range.clone().greater_than(29), Some(30..=30));
+		assert_eq!(range.greater_than(30), None);
 	}
 }

@@ -120,7 +120,7 @@ pub struct ValidatorsSet {
 /// Validators set change as it is stored in the runtime storage.
 #[derive(Encode, Decode, PartialEq, RuntimeDebug)]
 #[cfg_attr(test, derive(Clone))]
-pub struct ScheduledChange {
+pub struct AuraScheduledChange {
 	/// Validators of this set.
 	pub validators: Vec<Address>,
 	/// Hash of the block which has emitted previous validators change signal.
@@ -187,7 +187,7 @@ pub struct ImportContext<Submitter> {
 	parent_hash: H256,
 	parent_header: AuraHeader,
 	parent_total_difficulty: U256,
-	parent_scheduled_change: Option<ScheduledChange>,
+	parent_scheduled_change: Option<AuraScheduledChange>,
 	validators_set_id: u64,
 	validators_set: ValidatorsSet,
 	last_signal_block: Option<HeaderId>,
@@ -210,7 +210,7 @@ impl<Submitter> ImportContext<Submitter> {
 	}
 
 	/// Returns the validator set change if the parent header has signaled a change.
-	pub fn parent_scheduled_change(&self) -> Option<&ScheduledChange> {
+	pub fn parent_scheduled_change(&self) -> Option<&AuraScheduledChange> {
 		self.parent_scheduled_change.as_ref()
 	}
 
@@ -293,7 +293,7 @@ pub trait Storage {
 	) -> Option<ImportContext<Self::Submitter>>;
 	/// Get new validators that are scheduled by given header and hash of the previous
 	/// block that has scheduled change.
-	fn scheduled_change(&self, hash: &H256) -> Option<ScheduledChange>;
+	fn scheduled_change(&self, hash: &H256) -> Option<AuraScheduledChange>;
 	/// Insert imported header.
 	fn insert_header(&mut self, header: HeaderToImport<Self::Submitter>);
 	/// Finalize given block and schedules pruning of all headers
@@ -326,6 +326,25 @@ pub trait PruningStrategy: Default {
 	fn pruning_upper_bound(&mut self, best_number: u64, best_finalized_number: u64) -> u64;
 }
 
+/// ChainTime represents the runtime on-chain time
+pub trait ChainTime: Default {
+	/// Is a header timestamp ahead of the current on-chain time.
+	///
+	/// Check whether `timestamp` is ahead (i.e greater than) the current on-chain
+	/// time. If so, return `true`, `false` otherwise.
+	fn is_timestamp_ahead(&self, timestamp: u64) -> bool;
+}
+
+/// ChainTime implementation for the empty type.
+///
+/// This implementation will allow a runtime without the timestamp pallet to use
+/// the empty type as its ChainTime associated type.
+impl ChainTime for () {
+	fn is_timestamp_ahead(&self, _: u64) -> bool {
+		false
+	}
+}
+
 /// Callbacks for header submission rewards/penalties.
 pub trait OnHeadersSubmitted<AccountId> {
 	/// Called when valid headers have been submitted.
@@ -351,7 +370,7 @@ impl<AccountId> OnHeadersSubmitted<AccountId> for () {
 }
 
 /// The module configuration trait.
-pub trait Trait<I = DefaultInstance>: frame_system::Trait {
+pub trait Config<I = DefaultInstance>: frame_system::Config {
 	/// Aura configuration.
 	type AuraConfiguration: Get<AuraConfiguration>;
 	/// Validators configuration.
@@ -366,13 +385,15 @@ pub trait Trait<I = DefaultInstance>: frame_system::Trait {
 	type FinalityVotesCachingInterval: Get<Option<u64>>;
 	/// Headers pruning strategy.
 	type PruningStrategy: PruningStrategy;
+	/// Header timestamp verification against current on-chain time.
+	type ChainTime: ChainTime;
 
 	/// Handler for headers submission result.
 	type OnHeadersSubmitted: OnHeadersSubmitted<Self::AccountId>;
 }
 
 decl_module! {
-	pub struct Module<T: Trait<I>, I: Instance = DefaultInstance> for enum Call where origin: T::Origin {
+	pub struct Module<T: Config<I>, I: Instance = DefaultInstance> for enum Call where origin: T::Origin {
 		/// Import single Aura header. Requires transaction to be **UNSIGNED**.
 		#[weight = 0] // TODO: update me (https://github.com/paritytech/parity-bridges-common/issues/78)
 		pub fn import_unsigned_header(origin, header: AuraHeader, receipts: Option<Vec<Receipt>>) {
@@ -385,6 +406,7 @@ decl_module! {
 				&T::ValidatorsConfiguration::get(),
 				None,
 				header,
+				&T::ChainTime::default(),
 				receipts,
 			).map_err(|e| e.msg())?;
 		}
@@ -406,6 +428,7 @@ decl_module! {
 				&T::ValidatorsConfiguration::get(),
 				Some(submitter.clone()),
 				headers_with_receipts,
+				&T::ChainTime::default(),
 				&mut finalized_headers,
 			);
 
@@ -434,7 +457,7 @@ decl_module! {
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait<I>, I: Instance = DefaultInstance> as Bridge {
+	trait Store for Module<T: Config<I>, I: Instance = DefaultInstance> as Bridge {
 		/// Best known block.
 		BestBlock: (HeaderId, U256);
 		/// Best finalized block.
@@ -456,7 +479,7 @@ decl_storage! {
 		/// When it reaches zero, we are free to prune validator set as well.
 		ValidatorsSetsRc: map hasher(twox_64_concat) u64 => Option<u64>;
 		/// Map of validators set changes scheduled by given header.
-		ScheduledChanges: map hasher(identity) H256 => Option<ScheduledChange>;
+		ScheduledChanges: map hasher(identity) H256 => Option<AuraScheduledChange>;
 	}
 	add_extra_genesis {
 		config(initial_header): AuraHeader;
@@ -482,7 +505,7 @@ decl_storage! {
 	}
 }
 
-impl<T: Trait<I>, I: Instance> Module<T, I> {
+impl<T: Config<I>, I: Instance> Module<T, I> {
 	/// Returns number and hash of the best block known to the bridge module.
 	/// The caller should only submit `import_header` transaction that makes
 	/// (or leads to making) other header the best one.
@@ -519,7 +542,7 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 	}
 }
 
-impl<T: Trait<I>, I: Instance> frame_support::unsigned::ValidateUnsigned for Module<T, I> {
+impl<T: Config<I>, I: Instance> frame_support::unsigned::ValidateUnsigned for Module<T, I> {
 	type Call = Call<T, I>;
 
 	fn validate_unsigned(_source: TransactionSource, call: &Self::Call) -> TransactionValidity {
@@ -531,6 +554,7 @@ impl<T: Trait<I>, I: Instance> frame_support::unsigned::ValidateUnsigned for Mod
 					&T::ValidatorsConfiguration::get(),
 					&pool_configuration(),
 					header,
+					&T::ChainTime::default(),
 					receipts.as_ref(),
 				);
 
@@ -560,7 +584,7 @@ impl<T: Trait<I>, I: Instance> frame_support::unsigned::ValidateUnsigned for Mod
 #[derive(Default)]
 pub struct BridgeStorage<T, I = DefaultInstance>(sp_std::marker::PhantomData<(T, I)>);
 
-impl<T: Trait<I>, I: Instance> BridgeStorage<T, I> {
+impl<T: Config<I>, I: Instance> BridgeStorage<T, I> {
 	/// Create new BridgeStorage.
 	pub fn new() -> Self {
 		BridgeStorage(sp_std::marker::PhantomData::<(T, I)>::default())
@@ -659,7 +683,7 @@ impl<T: Trait<I>, I: Instance> BridgeStorage<T, I> {
 	}
 }
 
-impl<T: Trait<I>, I: Instance> Storage for BridgeStorage<T, I> {
+impl<T: Config<I>, I: Instance> Storage for BridgeStorage<T, I> {
 	type Submitter = T::AccountId;
 
 	fn best_block(&self) -> (HeaderId, U256) {
@@ -742,7 +766,7 @@ impl<T: Trait<I>, I: Instance> Storage for BridgeStorage<T, I> {
 		})
 	}
 
-	fn scheduled_change(&self, hash: &H256) -> Option<ScheduledChange> {
+	fn scheduled_change(&self, hash: &H256) -> Option<AuraScheduledChange> {
 		ScheduledChanges::<I>::get(hash)
 	}
 
@@ -753,7 +777,7 @@ impl<T: Trait<I>, I: Instance> Storage for BridgeStorage<T, I> {
 		if let Some(scheduled_change) = header.scheduled_change {
 			ScheduledChanges::<I>::insert(
 				&header.id.hash,
-				ScheduledChange {
+				AuraScheduledChange {
 					validators: scheduled_change,
 					prev_signal_block: header.context.last_signal_block,
 				},
@@ -839,7 +863,7 @@ impl<T: Trait<I>, I: Instance> Storage for BridgeStorage<T, I> {
 
 /// Initialize storage.
 #[cfg(any(feature = "std", feature = "runtime-benchmarks"))]
-pub(crate) fn initialize_storage<T: Trait<I>, I: Instance>(
+pub(crate) fn initialize_storage<T: Config<I>, I: Instance>(
 	initial_header: &AuraHeader,
 	initial_difficulty: U256,
 	initial_validators: &[Address],
@@ -1004,7 +1028,7 @@ fn pool_configuration() -> PoolConfiguration {
 }
 
 /// Return iterator of given header ancestors.
-fn ancestry<'a, S: Storage>(storage: &'a S, mut parent_hash: H256) -> impl Iterator<Item = (H256, AuraHeader)> + 'a {
+fn ancestry<S: Storage>(storage: &'_ S, mut parent_hash: H256) -> impl Iterator<Item = (H256, AuraHeader)> + '_ {
 	sp_std::iter::from_fn(move || {
 		let (header, _) = storage.header(&parent_hash)?;
 		if header.number == 0 {
@@ -1025,6 +1049,7 @@ pub(crate) mod tests {
 		genesis, insert_header, run_test, run_test_with_genesis, validators_addresses, HeaderBuilder, TestRuntime,
 		GAS_LIMIT,
 	};
+	use crate::test_utils::validator_utils::*;
 	use bp_eth_poa::compute_merkle_root;
 
 	const TOTAL_VALIDATORS: usize = 3;
@@ -1045,30 +1070,24 @@ pub(crate) mod tests {
 	}
 
 	fn example_header_with_failed_receipt() -> AuraHeader {
-		let mut header = AuraHeader::default();
-		header.number = 3;
-		header.transactions_root = compute_merkle_root(vec![example_tx()].into_iter());
-		header.receipts_root = compute_merkle_root(vec![example_tx_receipt(false)].into_iter());
-		header.parent_hash = example_header().compute_hash();
-		header
+		HeaderBuilder::with_parent(&example_header())
+			.transactions_root(compute_merkle_root(vec![example_tx()].into_iter()))
+			.receipts_root(compute_merkle_root(vec![example_tx_receipt(false)].into_iter()))
+			.sign_by(&validator(0))
 	}
 
 	fn example_header() -> AuraHeader {
-		let mut header = AuraHeader::default();
-		header.number = 2;
-		header.transactions_root = compute_merkle_root(vec![example_tx()].into_iter());
-		header.receipts_root = compute_merkle_root(vec![example_tx_receipt(true)].into_iter());
-		header.parent_hash = example_header_parent().compute_hash();
-		header
+		HeaderBuilder::with_parent(&example_header_parent())
+			.transactions_root(compute_merkle_root(vec![example_tx()].into_iter()))
+			.receipts_root(compute_merkle_root(vec![example_tx_receipt(true)].into_iter()))
+			.sign_by(&validator(0))
 	}
 
 	fn example_header_parent() -> AuraHeader {
-		let mut header = AuraHeader::default();
-		header.number = 1;
-		header.transactions_root = compute_merkle_root(vec![example_tx()].into_iter());
-		header.receipts_root = compute_merkle_root(vec![example_tx_receipt(true)].into_iter());
-		header.parent_hash = genesis().compute_hash();
-		header
+		HeaderBuilder::with_parent(&genesis())
+			.transactions_root(compute_merkle_root(vec![example_tx()].into_iter()))
+			.receipts_root(compute_merkle_root(vec![example_tx_receipt(true)].into_iter()))
+			.sign_by(&validator(0))
 	}
 
 	fn with_headers_to_prune<T>(f: impl Fn(BridgeStorage<TestRuntime>) -> T) -> T {
@@ -1095,7 +1114,7 @@ pub(crate) mod tests {
 					if i == 7 && j == 1 {
 						ScheduledChanges::<DefaultInstance>::insert(
 							hash,
-							ScheduledChange {
+							AuraScheduledChange {
 								validators: validators_addresses(5),
 								prev_signal_block: None,
 							},
@@ -1236,7 +1255,7 @@ pub(crate) mod tests {
 	fn finality_votes_are_cached() {
 		run_test(TOTAL_VALIDATORS, |ctx| {
 			let mut storage = BridgeStorage::<TestRuntime>::new();
-			let interval = <TestRuntime as Trait>::FinalityVotesCachingInterval::get().unwrap();
+			let interval = <TestRuntime as Config>::FinalityVotesCachingInterval::get().unwrap();
 
 			// for all headers with number < interval, cache entry is not created
 			for i in 1..interval {
@@ -1250,10 +1269,7 @@ pub(crate) mod tests {
 			let header_with_entry = HeaderBuilder::with_parent_number(interval - 1).sign_by_set(&ctx.validators);
 			let header_with_entry_hash = header_with_entry.compute_hash();
 			insert_header(&mut storage, header_with_entry);
-			assert_eq!(
-				FinalityCache::<TestRuntime>::get(&header_with_entry_hash),
-				Some(Default::default()),
-			);
+			assert!(FinalityCache::<TestRuntime>::get(&header_with_entry_hash).is_some());
 
 			// when we later prune this header, cache entry is removed
 			BlocksToPrune::<DefaultInstance>::put(PruningRange {

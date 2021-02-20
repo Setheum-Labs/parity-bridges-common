@@ -277,7 +277,7 @@ pub(crate) mod tests {
 	use super::*;
 	use crate::mock::{run_test, validators_addresses, validators_change_receipt, TestRuntime};
 	use crate::DefaultInstance;
-	use crate::{BridgeStorage, Headers, ScheduledChange, ScheduledChanges, StoredHeader};
+	use crate::{AuraScheduledChange, BridgeStorage, Headers, ScheduledChanges, StoredHeader};
 	use bp_eth_poa::compute_merkle_root;
 	use frame_support::StorageMap;
 
@@ -325,8 +325,10 @@ pub(crate) mod tests {
 		// when contract is active, but bloom has no required bits set
 		let config = ValidatorsConfiguration::Single(ValidatorsSource::Contract(Default::default(), Vec::new()));
 		let validators = Validators::new(&config);
-		let mut header = AuraHeader::default();
-		header.number = u64::max_value();
+		let mut header = AuraHeader {
+			number: u64::max_value(),
+			..Default::default()
+		};
 		assert!(!validators.maybe_signals_validators_change(&header));
 
 		// when contract is active and bloom has required bits set
@@ -347,10 +349,12 @@ pub(crate) mod tests {
 			(200, ValidatorsSource::Contract([3; 20].into(), vec![[3; 20].into()])),
 		]);
 		let validators = Validators::new(&config);
-		let mut header = AuraHeader::default();
+		let mut header = AuraHeader {
+			number: 100,
+			..Default::default()
+		};
 
 		// when we're at the block that switches to list source
-		header.number = 100;
 		assert_eq!(
 			validators.extract_validators_change(&header, None),
 			Ok((None, Some(vec![[2; 20].into()]))),
@@ -428,7 +432,7 @@ pub(crate) mod tests {
 				next_validators_set_id: 0,
 				last_signal_block: scheduled_at,
 			};
-			let scheduled_change = ScheduledChange {
+			let scheduled_change = AuraScheduledChange {
 				validators: validators_addresses(1),
 				prev_signal_block: None,
 			};

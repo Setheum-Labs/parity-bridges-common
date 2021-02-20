@@ -43,30 +43,18 @@ pub enum HeaderStatus {
 }
 
 /// Headers synchronization pipeline.
-pub trait HeadersSyncPipeline: Clone + Copy {
+pub trait HeadersSyncPipeline: Clone + Send + Sync {
 	/// Name of the headers source.
 	const SOURCE_NAME: &'static str;
 	/// Name of the headers target.
 	const TARGET_NAME: &'static str;
 
 	/// Headers we're syncing are identified by this hash.
-	type Hash: Eq + Clone + Copy + std::fmt::Debug + std::fmt::Display + std::hash::Hash;
+	type Hash: Eq + Clone + Copy + Send + Sync + std::fmt::Debug + std::fmt::Display + std::hash::Hash;
 	/// Headers we're syncing are identified by this number.
-	type Number: From<u32>
-		+ Ord
-		+ Clone
-		+ Copy
-		+ std::fmt::Debug
-		+ std::fmt::Display
-		+ std::hash::Hash
-		+ std::ops::Add<Output = Self::Number>
-		+ std::ops::Sub<Output = Self::Number>
-		+ num_traits::Saturating
-		+ num_traits::Zero
-		+ num_traits::One
-		+ Into<u64>;
+	type Number: relay_utils::BlockNumberBase;
 	/// Type of header that we're syncing.
-	type Header: Clone + std::fmt::Debug + PartialEq + SourceHeader<Self::Hash, Self::Number>;
+	type Header: SourceHeader<Self::Hash, Self::Number>;
 	/// Type of extra data for the header that we're receiving from the source node:
 	/// 1) extra data is required for some headers;
 	/// 2) target node may answer if it'll require extra data before header is submitted;
@@ -74,7 +62,7 @@ pub trait HeadersSyncPipeline: Clone + Copy {
 	/// 4) header and extra data are submitted in single transaction.
 	///
 	/// Example: Ethereum transactions receipts.
-	type Extra: Clone + PartialEq + std::fmt::Debug;
+	type Extra: Clone + Send + Sync + PartialEq + std::fmt::Debug;
 	/// Type of data required to 'complete' header that we're receiving from the source node:
 	/// 1) completion data is required for some headers;
 	/// 2) target node can't answer if it'll require completion data before header is accepted;
@@ -82,7 +70,7 @@ pub trait HeadersSyncPipeline: Clone + Copy {
 	/// 4) header and completion data are submitted in separate transactions.
 	///
 	/// Example: Substrate GRANDPA justifications.
-	type Completion: Clone + std::fmt::Debug;
+	type Completion: Clone + Send + Sync + std::fmt::Debug;
 
 	/// Function used to estimate size of target-encoded header.
 	fn estimate_size(source: &QueuedHeader<Self>) -> usize;
@@ -92,10 +80,12 @@ pub trait HeadersSyncPipeline: Clone + Copy {
 pub type HeaderIdOf<P> = HeaderId<<P as HeadersSyncPipeline>::Hash, <P as HeadersSyncPipeline>::Number>;
 
 /// Header that we're receiving from source node.
-pub trait SourceHeader<Hash, Number> {
+pub trait SourceHeader<Hash, Number>: Clone + std::fmt::Debug + PartialEq + Send + Sync {
 	/// Returns ID of header.
 	fn id(&self) -> HeaderId<Hash, Number>;
 	/// Returns ID of parent header.
+	///
+	/// Panics if called for genesis header.
 	fn parent_id(&self) -> HeaderId<Hash, Number>;
 }
 

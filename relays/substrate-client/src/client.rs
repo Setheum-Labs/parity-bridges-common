@@ -16,28 +16,53 @@
 
 //! Substrate node client.
 
-use crate::chain::Chain;
-use crate::rpc::Substrate;
-use crate::{ConnectionParams, Result};
+use crate::chain::{Chain, ChainWithBalances};
+use crate::rpc::{Substrate, SubstrateMessageLane};
+use crate::{ConnectionParams, Error, Result};
 
+use bp_message_lane::{LaneId, MessageNonce};
+use bp_runtime::InstanceId;
+use codec::Decode;
+use frame_system::AccountInfo;
 use jsonrpsee::common::DeserializeOwned;
 use jsonrpsee::raw::RawClient;
-use jsonrpsee::transport::http::HttpTransportClient;
-use jsonrpsee::Client as RpcClient;
+use jsonrpsee::transport::ws::WsTransportClient;
+use jsonrpsee::{client::Subscription, Client as RpcClient};
 use num_traits::Zero;
+use pallet_balances::AccountData;
 use sp_core::Bytes;
+use sp_trie::StorageProof;
+use sp_version::RuntimeVersion;
+use std::ops::RangeInclusive;
 
 const SUB_API_GRANDPA_AUTHORITIES: &str = "GrandpaApi_grandpa_authorities";
+
+/// Opaque justifications subscription type.
+pub type JustificationsSubscription = Subscription<Bytes>;
 
 /// Opaque GRANDPA authorities set.
 pub type OpaqueGrandpaAuthoritiesSet = Vec<u8>;
 
 /// Substrate client type.
+///
+/// Cloning `Client` is a cheap operation.
 pub struct Client<C: Chain> {
+	/// Client connection params.
+	params: ConnectionParams,
 	/// Substrate RPC client.
 	client: RpcClient,
 	/// Genesis block hash.
 	genesis_hash: C::Hash,
+}
+
+impl<C: Chain> Clone for Client<C> {
+	fn clone(&self) -> Self {
+		Client {
+			params: self.params.clone(),
+			client: self.client.clone(),
+			genesis_hash: self.genesis_hash,
+		}
+	}
 }
 
 impl<C: Chain> std::fmt::Debug for Client<C> {
@@ -49,32 +74,62 @@ impl<C: Chain> std::fmt::Debug for Client<C> {
 }
 
 impl<C: Chain> Client<C> {
-	/// Returns client that is able to call RPCs on Substrate node.
+	/// Returns client that is able to call RPCs on Substrate node over websocket connection.
 	pub async fn new(params: ConnectionParams) -> Result<Self> {
-		let uri = format!("http://{}:{}", params.host, params.port);
-		let transport = HttpTransportClient::new(&uri);
-		let raw_client = RawClient::new(transport);
-		let client: RpcClient = raw_client.into();
+		let client = Self::build_client(params.clone()).await?;
 
 		let number: C::BlockNumber = Zero::zero();
 		let genesis_hash = Substrate::<C, _, _>::chain_get_block_hash(&client, number).await?;
 
-		Ok(Self { client, genesis_hash })
+		Ok(Self {
+			params,
+			client,
+			genesis_hash,
+		})
+	}
+
+	/// Reopen client connection.
+	pub async fn reconnect(&mut self) -> Result<()> {
+		self.client = Self::build_client(self.params.clone()).await?;
+		Ok(())
+	}
+
+	/// Build client to use in connection.
+	async fn build_client(params: ConnectionParams) -> Result<RpcClient> {
+		let uri = format!("ws://{}:{}", params.host, params.port);
+		let transport = WsTransportClient::new(&uri).await?;
+		let raw_client = RawClient::new(transport);
+		Ok(raw_client.into())
 	}
 }
 
-impl<C: Chain> Client<C>
-where
-	C::Header: DeserializeOwned,
-	C::Index: DeserializeOwned,
-{
+impl<C: Chain> Client<C> {
+	/// Returns true if client is connected to at least one peer and is in synced state.
+	pub async fn ensure_synced(&self) -> Result<()> {
+		let health = Substrate::<C, _, _>::system_health(&self.client).await?;
+		let is_synced = !health.is_syncing && (!health.should_have_peers || health.peers > 0);
+		if is_synced {
+			Ok(())
+		} else {
+			Err(Error::ClientNotSynced(health))
+		}
+	}
+
 	/// Return hash of the genesis block.
 	pub fn genesis_hash(&self) -> &C::Hash {
 		&self.genesis_hash
 	}
 
+	/// Return hash of the best finalized block.
+	pub async fn best_finalized_header_hash(&self) -> Result<C::Hash> {
+		Ok(Substrate::<C, _, _>::chain_get_finalized_head(&self.client).await?)
+	}
+
 	/// Returns the best Substrate header.
-	pub async fn best_header(&self) -> Result<C::Header> {
+	pub async fn best_header(&self) -> Result<C::Header>
+	where
+		C::Header: DeserializeOwned,
+	{
 		Ok(Substrate::<C, _, _>::chain_get_header(&self.client, None).await?)
 	}
 
@@ -84,7 +139,10 @@ where
 	}
 
 	/// Get a Substrate header by its hash.
-	pub async fn header_by_hash(&self, block_hash: C::Hash) -> Result<C::Header> {
+	pub async fn header_by_hash(&self, block_hash: C::Hash) -> Result<C::Header>
+	where
+		C::Header: DeserializeOwned,
+	{
 		Ok(Substrate::<C, _, _>::chain_get_header(&self.client, block_hash).await?)
 	}
 
@@ -94,9 +152,32 @@ where
 	}
 
 	/// Get a Substrate header by its number.
-	pub async fn header_by_number(&self, block_number: C::BlockNumber) -> Result<C::Header> {
+	pub async fn header_by_number(&self, block_number: C::BlockNumber) -> Result<C::Header>
+	where
+		C::Header: DeserializeOwned,
+	{
 		let block_hash = Self::block_hash_by_number(self, block_number).await?;
 		Ok(Self::header_by_hash(self, block_hash).await?)
+	}
+
+	/// Return runtime version.
+	pub async fn runtime_version(&self) -> Result<RuntimeVersion> {
+		Ok(Substrate::<C, _, _>::runtime_version(&self.client).await?)
+	}
+
+	/// Return native tokens balance of the account.
+	pub async fn free_native_balance(&self, account: C::AccountId) -> Result<C::NativeBalance>
+	where
+		C: ChainWithBalances,
+	{
+		let storage_key = C::account_info_storage_key(&account);
+		let encoded_account_data = Substrate::<C, _, _>::get_storage(&self.client, storage_key)
+			.await?
+			.ok_or(Error::AccountDoesNotExist)?;
+		let decoded_account_data =
+			AccountInfo::<C::Index, AccountData<C::NativeBalance>>::decode(&mut &encoded_account_data.0[..])
+				.map_err(Error::ResponseParseFailed)?;
+		Ok(decoded_account_data.data.free)
 	}
 
 	/// Get the nonce of the given Substrate account.
@@ -131,5 +212,58 @@ where
 		Substrate::<C, _, _>::state_call(&self.client, method, data, at_block)
 			.await
 			.map_err(Into::into)
+	}
+
+	/// Returns proof-of-message(s) in given inclusive range.
+	pub async fn prove_messages(
+		&self,
+		instance: InstanceId,
+		lane: LaneId,
+		range: RangeInclusive<MessageNonce>,
+		include_outbound_lane_state: bool,
+		at_block: C::Hash,
+	) -> Result<StorageProof> {
+		let encoded_trie_nodes = SubstrateMessageLane::<C, _, _>::prove_messages(
+			&self.client,
+			instance,
+			lane,
+			*range.start(),
+			*range.end(),
+			include_outbound_lane_state,
+			Some(at_block),
+		)
+		.await
+		.map_err(Error::Request)?;
+		let decoded_trie_nodes: Vec<Vec<u8>> =
+			Decode::decode(&mut &encoded_trie_nodes[..]).map_err(Error::ResponseParseFailed)?;
+		Ok(StorageProof::new(decoded_trie_nodes))
+	}
+
+	/// Returns proof-of-message(s) delivery.
+	pub async fn prove_messages_delivery(
+		&self,
+		instance: InstanceId,
+		lane: LaneId,
+		at_block: C::Hash,
+	) -> Result<Vec<Vec<u8>>> {
+		let encoded_trie_nodes =
+			SubstrateMessageLane::<C, _, _>::prove_messages_delivery(&self.client, instance, lane, Some(at_block))
+				.await
+				.map_err(Error::Request)?;
+		let decoded_trie_nodes: Vec<Vec<u8>> =
+			Decode::decode(&mut &encoded_trie_nodes[..]).map_err(Error::ResponseParseFailed)?;
+		Ok(decoded_trie_nodes)
+	}
+
+	/// Return new justifications stream.
+	pub async fn subscribe_justifications(self) -> Result<JustificationsSubscription> {
+		Ok(self
+			.client
+			.subscribe(
+				"grandpa_subscribeJustifications",
+				jsonrpsee::common::Params::None,
+				"grandpa_unsubscribeJustifications",
+			)
+			.await?)
 	}
 }

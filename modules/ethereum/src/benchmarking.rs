@@ -26,8 +26,6 @@ use frame_benchmarking::benchmarks_instance;
 use frame_system::RawOrigin;
 
 benchmarks_instance! {
-	_ { }
-
 	// Benchmark `import_unsigned_header` extrinsic with the best possible conditions:
 	// * Parent header is finalized.
 	// * New header doesn't require receipts.
@@ -218,7 +216,7 @@ benchmarks_instance! {
 	}
 }
 
-fn initialize_bench<T: Trait<I>, I: Instance>(num_validators: usize) -> AuraHeader {
+fn initialize_bench<T: Config<I>, I: Instance>(num_validators: usize) -> AuraHeader {
 	// Initialize storage with some initial header
 	let initial_header = build_genesis_header(&validator(0));
 	let initial_difficulty = initial_header.difficulty;

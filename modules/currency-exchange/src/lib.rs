@@ -21,7 +21,7 @@
 use bp_currency_exchange::{
 	CurrencyConverter, DepositInto, Error as ExchangeError, MaybeLockFundsTransaction, RecipientsMap,
 };
-use bp_header_chain::BaseHeaderChain;
+use bp_header_chain::InclusionProofVerifier;
 use frame_support::{decl_error, decl_module, decl_storage, ensure};
 use sp_runtime::DispatchResult;
 
@@ -35,14 +35,14 @@ pub trait OnTransactionSubmitted<AccountId> {
 }
 
 /// The module configuration trait
-pub trait Trait<I = DefaultInstance>: frame_system::Trait {
+pub trait Config<I = DefaultInstance>: frame_system::Config {
 	/// Handler for transaction submission result.
 	type OnTransactionSubmitted: OnTransactionSubmitted<Self::AccountId>;
 	/// Represents the blockchain that we'll be exchanging currency with.
-	type PeerBlockchain: BaseHeaderChain;
+	type PeerBlockchain: InclusionProofVerifier;
 	/// Peer blockchain transaction parser.
 	type PeerMaybeLockFundsTransaction: MaybeLockFundsTransaction<
-		Transaction = <Self::PeerBlockchain as BaseHeaderChain>::Transaction,
+		Transaction = <Self::PeerBlockchain as InclusionProofVerifier>::Transaction,
 	>;
 	/// Map between blockchains recipients.
 	type RecipientsMap: RecipientsMap<
@@ -61,7 +61,7 @@ pub trait Trait<I = DefaultInstance>: frame_system::Trait {
 }
 
 decl_error! {
-	pub enum Error for Module<T: Trait<I>, I: Instance> {
+	pub enum Error for Module<T: Config<I>, I: Instance> {
 		/// Invalid peer blockchain transaction provided.
 		InvalidTransaction,
 		/// Peer transaction has invalid amount.
@@ -84,12 +84,12 @@ decl_error! {
 }
 
 decl_module! {
-	pub struct Module<T: Trait<I>, I: Instance = DefaultInstance> for enum Call where origin: T::Origin {
+	pub struct Module<T: Config<I>, I: Instance = DefaultInstance> for enum Call where origin: T::Origin {
 		/// Imports lock fund transaction of the peer blockchain.
 		#[weight = 0] // TODO: update me (https://github.com/paritytech/parity-bridges-common/issues/78)
 		pub fn import_peer_transaction(
 			origin,
-			proof: <<T as Trait<I>>::PeerBlockchain as BaseHeaderChain>::TransactionInclusionProof,
+			proof: <<T as Config<I>>::PeerBlockchain as InclusionProofVerifier>::TransactionInclusionProof,
 		) -> DispatchResult {
 			let submitter = frame_system::ensure_signed(origin)?;
 
@@ -125,16 +125,18 @@ decl_module! {
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait<I>, I: Instance = DefaultInstance> as Bridge {
+	trait Store for Module<T: Config<I>, I: Instance = DefaultInstance> as Bridge {
 		/// All transfers that have already been claimed.
 		Transfers: map hasher(blake2_128_concat) <T::PeerMaybeLockFundsTransaction as MaybeLockFundsTransaction>::Id => ();
 	}
 }
 
-impl<T: Trait<I>, I: Instance> Module<T, I> {
+impl<T: Config<I>, I: Instance> Module<T, I> {
 	/// Returns true if currency exchange module is able to import given transaction proof in
 	/// its current state.
-	pub fn filter_transaction_proof(proof: &<T::PeerBlockchain as BaseHeaderChain>::TransactionInclusionProof) -> bool {
+	pub fn filter_transaction_proof(
+		proof: &<T::PeerBlockchain as InclusionProofVerifier>::TransactionInclusionProof,
+	) -> bool {
 		if let Err(err) = prepare_deposit_details::<T, I>(proof) {
 			frame_support::debug::trace!(
 				target: "runtime",
@@ -149,7 +151,7 @@ impl<T: Trait<I>, I: Instance> Module<T, I> {
 	}
 }
 
-impl<T: Trait<I>, I: Instance> From<ExchangeError> for Error<T, I> {
+impl<T: Config<I>, I: Instance> From<ExchangeError> for Error<T, I> {
 	fn from(error: ExchangeError) -> Self {
 		match error {
 			ExchangeError::InvalidTransaction => Error::InvalidTransaction,
@@ -168,7 +170,7 @@ impl<AccountId> OnTransactionSubmitted<AccountId> for () {
 }
 
 /// Exchange deposit details.
-struct DepositDetails<T: Trait<I>, I: Instance> {
+struct DepositDetails<T: Config<I>, I: Instance> {
 	/// Transfer id.
 	pub transfer_id: <T::PeerMaybeLockFundsTransaction as MaybeLockFundsTransaction>::Id,
 	/// Transfer recipient.
@@ -179,16 +181,16 @@ struct DepositDetails<T: Trait<I>, I: Instance> {
 
 /// Verify and parse transaction proof, preparing everything required for importing
 /// this transaction proof.
-fn prepare_deposit_details<T: Trait<I>, I: Instance>(
-	proof: &<<T as Trait<I>>::PeerBlockchain as BaseHeaderChain>::TransactionInclusionProof,
+fn prepare_deposit_details<T: Config<I>, I: Instance>(
+	proof: &<<T as Config<I>>::PeerBlockchain as InclusionProofVerifier>::TransactionInclusionProof,
 ) -> Result<DepositDetails<T, I>, Error<T, I>> {
 	// ensure that transaction is included in finalized block that we know of
-	let transaction = <T as Trait<I>>::PeerBlockchain::verify_transaction_inclusion_proof(proof)
+	let transaction = <T as Config<I>>::PeerBlockchain::verify_transaction_inclusion_proof(proof)
 		.ok_or(Error::<T, I>::UnfinalizedTransaction)?;
 
 	// parse transaction
 	let transaction =
-		<T as Trait<I>>::PeerMaybeLockFundsTransaction::parse(&transaction).map_err(Error::<T, I>::from)?;
+		<T as Config<I>>::PeerMaybeLockFundsTransaction::parse(&transaction).map_err(Error::<T, I>::from)?;
 	let transfer_id = transaction.id;
 	ensure!(
 		!Transfers::<T, I>::contains_key(&transfer_id),
@@ -208,9 +210,12 @@ fn prepare_deposit_details<T: Trait<I>, I: Instance>(
 
 #[cfg(test)]
 mod tests {
+	// From construct_runtime macro
+	#![allow(clippy::from_over_into)]
+
 	use super::*;
 	use bp_currency_exchange::LockFundsTransaction;
-	use frame_support::{assert_noop, assert_ok, impl_outer_origin, parameter_types, weights::Weight};
+	use frame_support::{assert_noop, assert_ok, construct_runtime, parameter_types, weights::Weight};
 	use sp_core::H256;
 	use sp_runtime::{
 		testing::Header,
@@ -239,7 +244,7 @@ mod tests {
 
 	pub struct DummyBlockchain;
 
-	impl BaseHeaderChain for DummyBlockchain {
+	impl InclusionProofVerifier for DummyBlockchain {
 		type Transaction = RawTransaction;
 		type TransactionInclusionProof = (bool, RawTransaction);
 
@@ -311,11 +316,19 @@ mod tests {
 		}
 	}
 
-	#[derive(Clone, Eq, PartialEq)]
-	pub struct TestRuntime;
+	type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<TestRuntime>;
+	type Block = frame_system::mocking::MockBlock<TestRuntime>;
+	use crate as pallet_bridge_currency_exchange;
 
-	impl_outer_origin! {
-		pub enum Origin for TestRuntime where system = frame_system {}
+	construct_runtime! {
+		pub enum TestRuntime where
+			Block = Block,
+			NodeBlock = Block,
+			UncheckedExtrinsic = UncheckedExtrinsic,
+		{
+			System: frame_system::{Module, Call, Config, Storage, Event<T>},
+			Exchange: pallet_bridge_currency_exchange::{Module},
+		}
 	}
 
 	parameter_types! {
@@ -325,10 +338,10 @@ mod tests {
 		pub const AvailableBlockRatio: Perbill = Perbill::one();
 	}
 
-	impl frame_system::Trait for TestRuntime {
+	impl frame_system::Config for TestRuntime {
 		type Origin = Origin;
 		type Index = u64;
-		type Call = ();
+		type Call = Call;
 		type BlockNumber = u64;
 		type Hash = H256;
 		type Hashing = BlakeTwo256;
@@ -337,23 +350,20 @@ mod tests {
 		type Header = Header;
 		type Event = ();
 		type BlockHashCount = BlockHashCount;
-		type MaximumBlockWeight = MaximumBlockWeight;
-		type DbWeight = ();
-		type BlockExecutionWeight = ();
-		type ExtrinsicBaseWeight = ();
-		type MaximumExtrinsicWeight = ();
-		type AvailableBlockRatio = AvailableBlockRatio;
-		type MaximumBlockLength = MaximumBlockLength;
 		type Version = ();
-		type PalletInfo = ();
+		type PalletInfo = PalletInfo;
 		type AccountData = ();
 		type OnNewAccount = ();
 		type OnKilledAccount = ();
 		type BaseCallFilter = ();
 		type SystemWeightInfo = ();
+		type BlockWeights = ();
+		type BlockLength = ();
+		type DbWeight = ();
+		type SS58Prefix = ();
 	}
 
-	impl Trait for TestRuntime {
+	impl Config for TestRuntime {
 		type OnTransactionSubmitted = DummyTransactionSubmissionHandler;
 		type PeerBlockchain = DummyBlockchain;
 		type PeerMaybeLockFundsTransaction = DummyTransaction;
@@ -362,8 +372,6 @@ mod tests {
 		type CurrencyConverter = DummyCurrencyConverter;
 		type DepositInto = DummyDepositInto;
 	}
-
-	type Exchange = Module<TestRuntime>;
 
 	fn new_test_ext() -> sp_io::TestExternalities {
 		let t = frame_system::GenesisConfig::default()

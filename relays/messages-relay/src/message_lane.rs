@@ -19,43 +19,30 @@
 //! 1) relay new messages from source to target node;
 //! 2) relay proof-of-delivery from target to source node.
 
-use relay_utils::HeaderId;
-
-use num_traits::{One, Zero};
+use relay_utils::{BlockNumberBase, HeaderId};
 use std::fmt::Debug;
 
 /// One-way message lane.
-pub trait MessageLane {
+pub trait MessageLane: Clone + Send + Sync {
 	/// Name of the messages source.
 	const SOURCE_NAME: &'static str;
 	/// Name of the messages target.
 	const TARGET_NAME: &'static str;
 
-	/// Message nonce type.
-	type MessageNonce: Clone
-		+ Copy
-		+ Debug
-		+ Default
-		+ From<u32>
-		+ Ord
-		+ std::ops::Add<Output = Self::MessageNonce>
-		+ One
-		+ Zero;
-
 	/// Messages proof.
-	type MessagesProof: Clone;
+	type MessagesProof: Clone + Debug + Send + Sync;
 	/// Messages receiving proof.
-	type MessagesReceivingProof: Clone;
+	type MessagesReceivingProof: Clone + Debug + Send + Sync;
 
 	/// Number of the source header.
-	type SourceHeaderNumber: Clone + Debug + Default + Ord + PartialEq;
+	type SourceHeaderNumber: BlockNumberBase;
 	/// Hash of the source header.
-	type SourceHeaderHash: Clone + Debug + Default + PartialEq;
+	type SourceHeaderHash: Clone + Debug + Default + PartialEq + Send + Sync;
 
 	/// Number of the target header.
-	type TargetHeaderNumber: Clone + Debug + Default + Ord + PartialEq;
+	type TargetHeaderNumber: BlockNumberBase;
 	/// Hash of the target header.
-	type TargetHeaderHash: Clone + Debug + Default + PartialEq;
+	type TargetHeaderHash: Clone + Debug + Default + PartialEq + Send + Sync;
 }
 
 /// Source header id within given one-way message lane.

@@ -22,17 +22,26 @@ mod chain;
 mod client;
 mod error;
 mod rpc;
+mod sync_header;
 
-pub use crate::chain::{Chain, TransactionSignScheme};
-pub use crate::client::{Client, OpaqueGrandpaAuthoritiesSet};
+pub mod guard;
+pub mod headers_source;
+
+pub use crate::chain::{BlockWithJustification, Chain, ChainWithBalances, TransactionSignScheme};
+pub use crate::client::{Client, JustificationsSubscription, OpaqueGrandpaAuthoritiesSet};
 pub use crate::error::{Error, Result};
+pub use crate::sync_header::SyncHeader;
+pub use bp_runtime::{BlockNumberOf, Chain as ChainBase, HashOf, HeaderOf};
 
-/// Substrate connection params.
+/// Header id used by the chain.
+pub type HeaderIdOf<C> = relay_utils::HeaderId<HashOf<C>, BlockNumberOf<C>>;
+
+/// Substrate-over-websocket connection params.
 #[derive(Debug, Clone)]
 pub struct ConnectionParams {
-	/// Substrate RPC host.
+	/// Websocket server hostname.
 	pub host: String,
-	/// Substrate RPC port.
+	/// Websocket server TCP port.
 	pub port: u16,
 }
 
@@ -40,7 +49,7 @@ impl Default for ConnectionParams {
 	fn default() -> Self {
 		ConnectionParams {
 			host: "localhost".into(),
-			port: 9933,
+			port: 9944,
 		}
 	}
 }

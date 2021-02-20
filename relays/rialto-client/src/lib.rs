@@ -17,13 +17,12 @@
 //! Types used to connect to the Rialto-Substrate chain.
 
 use codec::Encode;
-use headers_relay::sync_types::SourceHeader;
-use relay_substrate_client::{Chain, Client, TransactionSignScheme};
-use sp_core::Pair;
-use sp_runtime::{
-	generic::SignedPayload,
-	traits::{Header as HeaderT, IdentifyAccount},
-};
+use relay_substrate_client::{Chain, ChainBase, ChainWithBalances, Client, TransactionSignScheme};
+use sp_core::{storage::StorageKey, Pair};
+use sp_runtime::{generic::SignedPayload, traits::IdentifyAccount};
+use std::time::Duration;
+
+pub use rialto_runtime::BridgeMillauCall;
 
 /// Rialto header id.
 pub type HeaderId = relay_utils::HeaderId<rialto_runtime::Hash, rialto_runtime::BlockNumber>;
@@ -32,14 +31,32 @@ pub type HeaderId = relay_utils::HeaderId<rialto_runtime::Hash, rialto_runtime::
 #[derive(Debug, Clone, Copy)]
 pub struct Rialto;
 
-impl Chain for Rialto {
+impl ChainBase for Rialto {
 	type BlockNumber = rialto_runtime::BlockNumber;
 	type Hash = rialto_runtime::Hash;
+	type Hasher = rialto_runtime::Hashing;
 	type Header = rialto_runtime::Header;
+}
+
+impl Chain for Rialto {
+	const NAME: &'static str = "Rialto";
+	const AVERAGE_BLOCK_INTERVAL: Duration = Duration::from_secs(5);
+
 	type AccountId = rialto_runtime::AccountId;
 	type Index = rialto_runtime::Index;
 	type SignedBlock = rialto_runtime::SignedBlock;
 	type Call = rialto_runtime::Call;
+}
+
+impl ChainWithBalances for Rialto {
+	type NativeBalance = rialto_runtime::Balance;
+
+	fn account_info_storage_key(account_id: &Self::AccountId) -> StorageKey {
+		use frame_support::storage::generator::StorageMap;
+		StorageKey(frame_system::Account::<rialto_runtime::Runtime>::storage_map_final_key(
+			account_id,
+		))
+	}
 }
 
 impl TransactionSignScheme for Rialto {
@@ -89,6 +106,15 @@ pub struct SigningParams {
 	pub signer: sp_core::sr25519::Pair,
 }
 
+impl SigningParams {
+	/// Create signing params from SURI and password.
+	pub fn from_suri(suri: &str, password: Option<&str>) -> Result<Self, sp_core::crypto::SecretStringError> {
+		Ok(SigningParams {
+			signer: sp_core::sr25519::Pair::from_string(suri, password)?,
+		})
+	}
+}
+
 impl std::fmt::Debug for SigningParams {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 		write!(f, "{}", self.signer.public())
@@ -104,29 +130,4 @@ impl Default for SigningParams {
 }
 
 /// Rialto header type used in headers sync.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SyncHeader(rialto_runtime::Header);
-
-impl std::ops::Deref for SyncHeader {
-	type Target = rialto_runtime::Header;
-
-	fn deref(&self) -> &Self::Target {
-		&self.0
-	}
-}
-
-impl From<rialto_runtime::Header> for SyncHeader {
-	fn from(header: rialto_runtime::Header) -> Self {
-		Self(header)
-	}
-}
-
-impl SourceHeader<rialto_runtime::Hash, rialto_runtime::BlockNumber> for SyncHeader {
-	fn id(&self) -> HeaderId {
-		relay_utils::HeaderId(*self.number(), self.hash())
-	}
-
-	fn parent_id(&self) -> HeaderId {
-		relay_utils::HeaderId(*self.number() - 1, *self.parent_hash())
-	}
-}
+pub type SyncHeader = relay_substrate_client::SyncHeader<rialto_runtime::Header>;

@@ -9,6 +9,7 @@ on:
       - diagrams/
   schedule:                                         # Nightly build
     - cron:                                         '0 1 * * *'
+
 jobs:
 ## Publish to Docker hub
   publish:
@@ -17,13 +18,19 @@ jobs:
       matrix:
         project:
           - rialto-bridge-node
+          - millau-bridge-node
           - ethereum-poa-relay
+          - substrate-relay
         include:
           - project: rialto-bridge-node
             healthcheck: http://localhost:9933/health
+          - project: millau-bridge-node
+            healthcheck: http://localhost:9933/health
           - project: ethereum-poa-relay
             healthcheck: http://localhost:9616/metrics
-    runs-on:                                        self-hosted
+          - project: substrate-relay
+            healthcheck: http://localhost:9616/metrics
+    runs-on:                                        ubuntu-latest
     container:
       image:                                        docker:git
     steps:

@@ -16,22 +16,38 @@
 
 //! Primitives of message lane module, that are used on the source chain.
 
-use crate::{LaneId, MessageNonce};
+use crate::{InboundLaneData, LaneId, MessageNonce, OutboundLaneData};
 
-use frame_support::Parameter;
-use sp_std::fmt::Debug;
+use bp_runtime::Size;
+use frame_support::{Parameter, RuntimeDebug};
+use sp_std::{collections::btree_map::BTreeMap, fmt::Debug};
+
+/// The sender of the message on the source chain.
+pub type Sender<AccountId> = frame_system::RawOrigin<AccountId>;
+
+/// Relayers rewards, grouped by relayer account id.
+pub type RelayersRewards<AccountId, Balance> = BTreeMap<AccountId, RelayerRewards<Balance>>;
+
+/// Single relayer rewards.
+#[derive(RuntimeDebug, Default)]
+pub struct RelayerRewards<Balance> {
+	/// Total rewards that are to be paid to the relayer.
+	pub reward: Balance,
+	/// Total number of messages relayed by this relayer.
+	pub messages: MessageNonce,
+}
 
 /// Target chain API. Used by source chain to verify target chain proofs.
 ///
 /// All implementations of this trait should only work with finalized data that
 /// can't change. Wrong implementation may lead to invalid lane states (i.e. lane
 /// that's stuck) and/or processing messages without paying fees.
-pub trait TargetHeaderChain<Payload> {
+pub trait TargetHeaderChain<Payload, AccountId> {
 	/// Error type.
 	type Error: Debug + Into<&'static str>;
 
 	/// Proof that messages have been received by target chain.
-	type MessagesDeliveryProof: Parameter;
+	type MessagesDeliveryProof: Parameter + Size;
 
 	/// Verify message payload before we accept it.
 	///
@@ -50,7 +66,7 @@ pub trait TargetHeaderChain<Payload> {
 	/// Verify messages delivery proof and return lane && nonce of the latest recevied message.
 	fn verify_messages_delivery_proof(
 		proof: Self::MessagesDeliveryProof,
-	) -> Result<(LaneId, MessageNonce), Self::Error>;
+	) -> Result<(LaneId, InboundLaneData<AccountId>), Self::Error>;
 }
 
 /// Lane message verifier.
@@ -67,9 +83,10 @@ pub trait LaneMessageVerifier<Submitter, Payload, Fee> {
 
 	/// Verify message payload and return Ok(()) if message is valid and allowed to be sent over the lane.
 	fn verify_message(
-		submitter: &Submitter,
+		submitter: &Sender<Submitter>,
 		delivery_and_dispatch_fee: &Fee,
 		lane: &LaneId,
+		outbound_data: &OutboundLaneData,
 		payload: &Payload,
 	) -> Result<(), Self::Error>;
 }
@@ -93,5 +110,83 @@ pub trait MessageDeliveryAndDispatchPayment<AccountId, Balance> {
 
 	/// Withhold/write-off delivery_and_dispatch_fee from submitter account to
 	/// some relayers-fund account.
-	fn pay_delivery_and_dispatch_fee(submitter: &AccountId, fee: &Balance) -> Result<(), Self::Error>;
+	fn pay_delivery_and_dispatch_fee(
+		submitter: &Sender<AccountId>,
+		fee: &Balance,
+		relayer_fund_account: &AccountId,
+	) -> Result<(), Self::Error>;
+
+	/// Pay rewards for delivering messages to the given relayers.
+	///
+	/// The implementation may also choose to pay reward to the `confirmation_relayer`, which is
+	/// a relayer that has submitted delivery confirmation transaction.
+	fn pay_relayers_rewards(
+		confirmation_relayer: &AccountId,
+		relayers_rewards: RelayersRewards<AccountId, Balance>,
+		relayer_fund_account: &AccountId,
+	);
+
+	/// Perform some initialization in externalities-provided environment.
+	///
+	/// For instance you may ensure that particular required accounts or storage items are present.
+	/// Returns the number of storage reads performed.
+	fn initialize(_relayer_fund_account: &AccountId) -> usize {
+		0
+	}
+}
+
+/// Structure that may be used in place of `TargetHeaderChain`, `LaneMessageVerifier` and
+/// `MessageDeliveryAndDispatchPayment` on chains, where outbound messages are forbidden.
+pub struct ForbidOutboundMessages;
+
+/// Error message that is used in `ForbidOutboundMessages` implementation.
+const ALL_OUTBOUND_MESSAGES_REJECTED: &str = "This chain is configured to reject all outbound messages";
+
+impl<Payload, AccountId> TargetHeaderChain<Payload, AccountId> for ForbidOutboundMessages {
+	type Error = &'static str;
+
+	type MessagesDeliveryProof = ();
+
+	fn verify_message(_payload: &Payload) -> Result<(), Self::Error> {
+		Err(ALL_OUTBOUND_MESSAGES_REJECTED)
+	}
+
+	fn verify_messages_delivery_proof(
+		_proof: Self::MessagesDeliveryProof,
+	) -> Result<(LaneId, InboundLaneData<AccountId>), Self::Error> {
+		Err(ALL_OUTBOUND_MESSAGES_REJECTED)
+	}
+}
+
+impl<Submitter, Payload, Fee> LaneMessageVerifier<Submitter, Payload, Fee> for ForbidOutboundMessages {
+	type Error = &'static str;
+
+	fn verify_message(
+		_submitter: &Sender<Submitter>,
+		_delivery_and_dispatch_fee: &Fee,
+		_lane: &LaneId,
+		_outbound_data: &OutboundLaneData,
+		_payload: &Payload,
+	) -> Result<(), Self::Error> {
+		Err(ALL_OUTBOUND_MESSAGES_REJECTED)
+	}
+}
+
+impl<AccountId, Balance> MessageDeliveryAndDispatchPayment<AccountId, Balance> for ForbidOutboundMessages {
+	type Error = &'static str;
+
+	fn pay_delivery_and_dispatch_fee(
+		_submitter: &Sender<AccountId>,
+		_fee: &Balance,
+		_relayer_fund_account: &AccountId,
+	) -> Result<(), Self::Error> {
+		Err(ALL_OUTBOUND_MESSAGES_REJECTED)
+	}
+
+	fn pay_relayers_rewards(
+		_confirmation_relayer: &AccountId,
+		_relayers_rewards: RelayersRewards<AccountId, Balance>,
+		_relayer_fund_account: &AccountId,
+	) {
+	}
 }

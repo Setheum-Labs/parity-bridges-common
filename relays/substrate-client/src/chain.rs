@@ -16,56 +16,60 @@
 
 use crate::client::Client;
 
+use bp_runtime::Chain as ChainBase;
 use frame_support::Parameter;
 use jsonrpsee::common::{DeserializeOwned, Serialize};
-use sp_core::Pair;
-use sp_runtime::traits::{
-	AtLeast32Bit, AtLeast32BitUnsigned, Bounded, CheckEqual, Dispatchable, Header as HeaderT, MaybeDisplay,
-	MaybeMallocSizeOf, MaybeSerialize, MaybeSerializeDeserialize, Member, SimpleBitOps,
+use num_traits::{CheckedSub, Zero};
+use sp_core::{storage::StorageKey, Pair};
+use sp_runtime::{
+	generic::SignedBlock,
+	traits::{AtLeast32Bit, Dispatchable, MaybeDisplay, MaybeSerialize, MaybeSerializeDeserialize, Member},
+	Justification,
 };
-use sp_std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 /// Substrate-based chain from minimal relay-client point of view.
-pub trait Chain {
-	/// The block number type used by the runtime.
-	type BlockNumber: Parameter
-		+ Member
-		+ MaybeSerializeDeserialize
-		+ Debug
-		+ MaybeDisplay
-		+ AtLeast32BitUnsigned
-		+ Default
-		+ Bounded
-		+ Copy
-		+ sp_std::hash::Hash
-		+ sp_std::str::FromStr
-		+ MaybeMallocSizeOf;
-	/// The output of the `Hashing` function.
-	type Hash: Parameter
-		+ Member
-		+ MaybeSerializeDeserialize
-		+ Debug
-		+ MaybeDisplay
-		+ SimpleBitOps
-		+ Ord
-		+ Default
-		+ Copy
-		+ CheckEqual
-		+ sp_std::hash::Hash
-		+ AsRef<[u8]>
-		+ AsMut<[u8]>
-		+ MaybeMallocSizeOf;
-	/// The block header.
-	type Header: Parameter + HeaderT<Number = Self::BlockNumber, Hash = Self::Hash>;
+pub trait Chain: ChainBase {
+	/// Chain name.
+	const NAME: &'static str;
+	/// Average block interval.
+	///
+	/// How often blocks are produced on that chain. It's suggested to set this value
+	/// to match the block time of the chain.
+	const AVERAGE_BLOCK_INTERVAL: Duration;
+
 	/// The user account identifier type for the runtime.
 	type AccountId: Parameter + Member + MaybeSerializeDeserialize + Debug + MaybeDisplay + Ord + Default;
-	/// Account index (aka nonce) type. This stores the number of previous transactions associated
-	/// with a sender account.
-	type Index: Parameter + Member + MaybeSerialize + Debug + Default + MaybeDisplay + AtLeast32Bit + Copy;
+	/// Index of a transaction used by the chain.
+	type Index: Parameter
+		+ Member
+		+ MaybeSerialize
+		+ Debug
+		+ Default
+		+ MaybeDisplay
+		+ DeserializeOwned
+		+ AtLeast32Bit
+		+ Copy;
 	/// Block type.
-	type SignedBlock: Member + Serialize + DeserializeOwned;
+	type SignedBlock: Member + Serialize + DeserializeOwned + BlockWithJustification;
 	/// The aggregated `Call` type.
 	type Call: Dispatchable + Debug;
+}
+
+/// Substrate-based chain with `frame_system::Config::AccountData` set to
+/// the `pallet_balances::AccountData<NativeBalance>`.
+pub trait ChainWithBalances: Chain {
+	/// Balance of an account in native tokens.
+	type NativeBalance: Parameter + Member + DeserializeOwned + Clone + Copy + CheckedSub + PartialOrd + Zero;
+
+	/// Return runtime storage key for getting `frame_system::AccountInfo` of given account.
+	fn account_info_storage_key(account_id: &Self::AccountId) -> StorageKey;
+}
+
+/// Block with justification.
+pub trait BlockWithJustification {
+	/// Return block justification, if known.
+	fn justification(&self) -> Option<&Justification>;
 }
 
 /// Substrate-based chain transactions signing scheme.
@@ -84,4 +88,16 @@ pub trait TransactionSignScheme {
 		signer_nonce: <Self::Chain as Chain>::Index,
 		call: <Self::Chain as Chain>::Call,
 	) -> Self::SignedTransaction;
+}
+
+impl BlockWithJustification for () {
+	fn justification(&self) -> Option<&Justification> {
+		None
+	}
+}
+
+impl<Block> BlockWithJustification for SignedBlock<Block> {
+	fn justification(&self) -> Option<&Justification> {
+		self.justification.as_ref()
+	}
 }

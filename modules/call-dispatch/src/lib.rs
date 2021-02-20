@@ -16,59 +16,82 @@
 
 //! Runtime module which takes care of dispatching messages received over the bridge.
 //!
-//! The messages are interpreted directly as runtime `Call`s, we attempt to decode
-//! them and then dispatch as usualy.
-//! To prevent compatibility issues, the calls have to include `spec_version` as well
-//! which is being checked before dispatch.
-//!
-//! In case of succesful dispatch event is emitted.
+//! The messages are interpreted directly as runtime `Call`. We attempt to decode
+//! them and then dispatch as usual. To prevent compatibility issues, the Calls have
+//! to include a `spec_version`. This will be checked before dispatch. In the case of
+//! a succesful dispatch an event is emitted.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![warn(missing_docs)]
 
 use bp_message_dispatch::{MessageDispatch, Weight};
-use bp_runtime::{bridge_account_id, InstanceId, CALL_DISPATCH_MODULE_PREFIX};
+use bp_runtime::{derive_account_id, InstanceId, Size, SourceAccount};
 use codec::{Decode, Encode};
 use frame_support::{
 	decl_event, decl_module, decl_storage,
 	dispatch::{Dispatchable, Parameter},
-	traits::Get,
+	ensure,
+	traits::{Filter, Get},
 	weights::{extract_actual_weight, GetDispatchInfo},
 	RuntimeDebug,
 };
-use frame_system::{ensure_root, ensure_signed, RawOrigin};
+use frame_system::RawOrigin;
 use sp_runtime::{
-	traits::{BadOrigin, IdentifyAccount, Verify},
+	traits::{BadOrigin, Convert, IdentifyAccount, MaybeDisplay, MaybeSerializeDeserialize, Member, Verify},
 	DispatchResult,
 };
-use sp_std::{marker::PhantomData, prelude::*};
+use sp_std::{fmt::Debug, marker::PhantomData, prelude::*};
 
 /// Spec version type.
 pub type SpecVersion = u32;
 
-/// Origin of the call on the target chain.
-#[derive(RuntimeDebug, Encode, Decode, Clone)]
-pub enum CallOrigin<SourceChainAccountPublic, TargetChainAccountPublic, TargetChainSignature> {
-	/// Call is originated from bridge account, which is (designed to be) specific to
-	/// the single deployed instance of the messages bridge (message-lane, ...) module.
-	/// It is assumed that this account is not controlled by anyone and has zero balance
-	/// (unless someone would make transfer by mistake?).
-	/// If we trust the source chain to allow sending calls with that origin in case they originate
-	/// from source chain `root` account (default implementation), `BridgeAccount` represents the
-	/// source-chain-root origin on the target chain and can be used to send and authorize
-	/// "control plane" messages between the two runtimes.
-	BridgeAccount,
-	/// Call is originated from account, identified by `TargetChainAccountPublic`. The proof
-	/// that the `SourceChainAccountPublic` controls `TargetChainAccountPublic` is the
-	/// `TargetChainSignature` over `(Call, SourceChainAccountPublic).encode()`.
-	/// The source chain must ensure that the message is sent by the owner of
-	/// `SourceChainAccountPublic` account (use the `fn verify_sending_message()`).
-	RealAccount(SourceChainAccountPublic, TargetChainAccountPublic, TargetChainSignature),
+/// Origin of a Call when it is dispatched on the target chain.
+///
+/// The source chain can (and should) verify that the message can be dispatched on the target chain
+/// with a particular origin given the source chain's origin. This can be done with the
+/// `verify_message_origin()` function.
+#[derive(RuntimeDebug, Encode, Decode, Clone, PartialEq, Eq)]
+pub enum CallOrigin<SourceChainAccountId, TargetChainAccountPublic, TargetChainSignature> {
+	/// Call is sent by the Root origin on the source chain. On the target chain it is dispatched
+	/// from a derived account.
+	///
+	/// The derived account represents the source Root account on the target chain. This is useful
+	/// if the target chain needs some way of knowing that a call came from a priviledged origin on
+	/// the source chain (maybe to allow a configuration change for example).
+	SourceRoot,
+
+	/// Call is sent by `SourceChainAccountId` on the source chain. On the target chain it is
+	/// dispatched from an account controlled by a private key on the target chain.
+	///
+	/// The account can be identified by `TargetChainAccountPublic`. The proof that the
+	/// `SourceChainAccountId` controls `TargetChainAccountPublic` is the `TargetChainSignature`
+	/// over `(Call, SourceChainAccountId, TargetChainSpecVersion, SourceChainBridgeId).encode()`.
+	///
+	/// NOTE sending messages using this origin (or any other) does not have replay protection!
+	/// The assumption is that both the source account and the target account is controlled by
+	/// the same entity, so source-chain replay protection is sufficient.
+	/// As a consequence, it's extremely important for the target chain user to never produce
+	/// a signature with their target-private key on something that could be sent over the bridge,
+	/// i.e. if the target user signs `(<some-source-account-id>, Call::Transfer(X, 5))`
+	/// The owner of `some-source-account-id` can send that message multiple times, which would
+	/// result with multiple transfer calls being dispatched on the target chain.
+	/// So please, NEVER USE YOUR PRIVATE KEY TO SIGN SOMETHING YOU DON'T FULLY UNDERSTAND!
+	TargetAccount(SourceChainAccountId, TargetChainAccountPublic, TargetChainSignature),
+
+	/// Call is sent by the `SourceChainAccountId` on the source chain. On the target chain it is
+	/// dispatched from a derived account ID.
+	///
+	/// The account ID on the target chain is derived from the source account ID This is useful if
+	/// you need a way to represent foreign accounts on this chain for call dispatch purposes.
+	///
+	/// Note that the derived account does not need to have a private key on the target chain. This
+	/// origin can therefore represent proxies, pallets, etc. as well as "regular" accounts.
+	SourceAccount(SourceChainAccountId),
 }
 
 /// Message payload type used by call-dispatch module.
-#[derive(RuntimeDebug, Encode, Decode, Clone)]
-pub struct MessagePayload<SourceChainAccountPublic, TargetChainAccountPublic, TargetChainSignature, Call> {
+#[derive(RuntimeDebug, Encode, Decode, Clone, PartialEq, Eq)]
+pub struct MessagePayload<SourceChainAccountId, TargetChainAccountPublic, TargetChainSignature, Call> {
 	/// Runtime specification version. We only dispatch messages that have the same
 	/// runtime version. Otherwise we risk to misinterpret encoded calls.
 	pub spec_version: SpecVersion,
@@ -76,21 +99,29 @@ pub struct MessagePayload<SourceChainAccountPublic, TargetChainAccountPublic, Ta
 	/// static weight, the call is not dispatched.
 	pub weight: Weight,
 	/// Call origin to be used during dispatch.
-	pub origin: CallOrigin<SourceChainAccountPublic, TargetChainAccountPublic, TargetChainSignature>,
+	pub origin: CallOrigin<SourceChainAccountId, TargetChainAccountPublic, TargetChainSignature>,
 	/// The call itself.
 	pub call: Call,
 }
 
+impl<SourceChainAccountId, TargetChainAccountPublic, TargetChainSignature> Size
+	for MessagePayload<SourceChainAccountId, TargetChainAccountPublic, TargetChainSignature, Vec<u8>>
+{
+	fn size_hint(&self) -> u32 {
+		self.call.len() as _
+	}
+}
+
 /// The module configuration trait.
-pub trait Trait<I = DefaultInstance>: frame_system::Trait {
+pub trait Config<I = DefaultInstance>: frame_system::Config {
 	/// The overarching event type.
-	type Event: From<Event<Self, I>> + Into<<Self as frame_system::Trait>::Event>;
+	type Event: From<Event<Self, I>> + Into<<Self as frame_system::Config>::Event>;
 	/// Id of the message. Whenever message is passed to the dispatch module, it emits
 	/// event with this id + dispatch result. Could be e.g. (LaneId, MessageNonce) if
 	/// it comes from message-lane module.
 	type MessageId: Parameter;
-	/// Type of account public key on source chain.
-	type SourceChainAccountPublic: Parameter;
+	/// Type of account ID on source chain.
+	type SourceChainAccountId: Parameter + Member + MaybeSerializeDeserialize + Debug + MaybeDisplay + Ord + Default;
 	/// Type of account public key on target chain.
 	type TargetChainAccountPublic: Parameter + IdentifyAccount<AccountId = Self::AccountId>;
 	/// Type of signature that may prove that the message has been signed by
@@ -100,20 +131,37 @@ pub trait Trait<I = DefaultInstance>: frame_system::Trait {
 	type Call: Parameter
 		+ GetDispatchInfo
 		+ Dispatchable<
-			Origin = <Self as frame_system::Trait>::Origin,
+			Origin = <Self as frame_system::Config>::Origin,
 			PostInfo = frame_support::dispatch::PostDispatchInfo,
 		>;
+	/// Pre-dispatch filter for incoming calls.
+	///
+	/// The pallet will filter all incoming calls right before they're dispatched. If this filter
+	/// rejects the call, special event (`Event::MessageCallRejected`) is emitted.
+	type CallFilter: Filter<<Self as Config<I>>::Call>;
+	/// The type that is used to wrap the `Self::Call` when it is moved over bridge.
+	///
+	/// The idea behind this is to avoid `Call` conversion/decoding until we'll be sure
+	/// that all other stuff (like `spec_version`) is ok. If we would try to decode
+	/// `Call` which has been encoded using previous `spec_version`, then we might end
+	/// up with decoding error, instead of `MessageVersionSpecMismatch`.
+	type EncodedCall: Decode + Encode + Into<Result<<Self as Config<I>>::Call, ()>>;
+	/// A type which can be turned into an AccountId from a 256-bit hash.
+	///
+	/// Used when deriving target chain AccountIds from source chain AccountIds.
+	type AccountIdConverter: sp_runtime::traits::Convert<sp_core::hash::H256, Self::AccountId>;
 }
 
 decl_storage! {
-	trait Store for Module<T: Trait<I>, I: Instance = DefaultInstance> as CallDispatch {
-	}
+	trait Store for Module<T: Config<I>, I: Instance = DefaultInstance> as CallDispatch {}
 }
 
 decl_event!(
 	pub enum Event<T, I = DefaultInstance> where
-		<T as Trait<I>>::MessageId
+		<T as Config<I>>::MessageId
 	{
+		/// Message has been rejected before reaching dispatch.
+		MessageRejected(InstanceId, MessageId),
 		/// Message has been rejected by dispatcher because of spec version mismatch.
 		/// Last two arguments are: expected and passed spec version.
 		MessageVersionSpecMismatch(InstanceId, MessageId, SpecVersion, SpecVersion),
@@ -124,35 +172,45 @@ decl_event!(
 		MessageSignatureMismatch(InstanceId, MessageId),
 		/// Message has been dispatched with given result.
 		MessageDispatched(InstanceId, MessageId, DispatchResult),
-		/// Phantom member, never used.
-		Dummy(PhantomData<I>),
+		/// We have failed to decode Call from the message.
+		MessageCallDecodeFailed(InstanceId, MessageId),
+		/// The call from the message has been rejected by the call filter.
+		MessageCallRejected(InstanceId, MessageId),
+		/// Phantom member, never used. Needed to handle multiple pallet instances.
+		_Dummy(PhantomData<I>),
 	}
 );
 
 decl_module! {
 	/// Call Dispatch FRAME Pallet.
-	pub struct Module<T: Trait<I>, I: Instance = DefaultInstance> for enum Call where origin: T::Origin {
+	pub struct Module<T: Config<I>, I: Instance = DefaultInstance> for enum Call where origin: T::Origin {
 		/// Deposit one of this module's events by using the default implementation.
 		fn deposit_event() = default;
 	}
 }
 
-impl<T: Trait<I>, I: Instance> MessageDispatch<T::MessageId> for Module<T, I> {
-	type Message = MessagePayload<
-		T::SourceChainAccountPublic,
-		T::TargetChainAccountPublic,
-		T::TargetChainSignature,
-		<T as Trait<I>>::Call,
-	>;
+impl<T: Config<I>, I: Instance> MessageDispatch<T::MessageId> for Module<T, I> {
+	type Message =
+		MessagePayload<T::SourceChainAccountId, T::TargetChainAccountPublic, T::TargetChainSignature, T::EncodedCall>;
 
 	fn dispatch_weight(message: &Self::Message) -> Weight {
 		message.weight
 	}
 
-	fn dispatch(bridge: InstanceId, id: T::MessageId, message: Self::Message) {
+	fn dispatch(bridge: InstanceId, id: T::MessageId, message: Result<Self::Message, ()>) {
+		// emit special even if message has been rejected by external component
+		let message = match message {
+			Ok(message) => message,
+			Err(_) => {
+				frame_support::debug::trace!("Message {:?}/{:?}: rejected before actual dispatch", bridge, id);
+				Self::deposit_event(RawEvent::MessageRejected(bridge, id));
+				return;
+			}
+		};
+
 		// verify spec version
 		// (we want it to be the same, because otherwise we may decode Call improperly)
-		let expected_version = <T as frame_system::Trait>::Version::get().spec_version;
+		let expected_version = <T as frame_system::Config>::Version::get().spec_version;
 		if message.spec_version != expected_version {
 			frame_support::debug::trace!(
 				"Message {:?}/{:?}: spec_version mismatch. Expected {:?}, got {:?}",
@@ -170,10 +228,67 @@ impl<T: Trait<I>, I: Instance> MessageDispatch<T::MessageId> for Module<T, I> {
 			return;
 		}
 
+		// now that we have spec version checked, let's decode the call
+		let call = match message.call.into() {
+			Ok(call) => call,
+			Err(_) => {
+				frame_support::debug::trace!("Failed to decode Call from message {:?}/{:?}", bridge, id,);
+				Self::deposit_event(RawEvent::MessageCallDecodeFailed(bridge, id));
+				return;
+			}
+		};
+
+		// prepare dispatch origin
+		let origin_account = match message.origin {
+			CallOrigin::SourceRoot => {
+				let hex_id = derive_account_id::<T::SourceChainAccountId>(bridge, SourceAccount::Root);
+				let target_id = T::AccountIdConverter::convert(hex_id);
+				frame_support::debug::trace!("Root Account: {:?}", &target_id);
+				target_id
+			}
+			CallOrigin::TargetAccount(source_account_id, target_public, target_signature) => {
+				let digest = account_ownership_digest(&call, source_account_id, message.spec_version, bridge);
+
+				let target_account = target_public.into_account();
+				if !target_signature.verify(&digest[..], &target_account) {
+					frame_support::debug::trace!(
+						"Message {:?}/{:?}: origin proof is invalid. Expected account: {:?} from signature: {:?}",
+						bridge,
+						id,
+						target_account,
+						target_signature,
+					);
+					Self::deposit_event(RawEvent::MessageSignatureMismatch(bridge, id));
+					return;
+				}
+
+				frame_support::debug::trace!("Target Account: {:?}", &target_account);
+				target_account
+			}
+			CallOrigin::SourceAccount(source_account_id) => {
+				let hex_id = derive_account_id(bridge, SourceAccount::Account(source_account_id));
+				let target_id = T::AccountIdConverter::convert(hex_id);
+				frame_support::debug::trace!("Source Account: {:?}", &target_id);
+				target_id
+			}
+		};
+
+		// filter the call
+		if !T::CallFilter::filter(&call) {
+			frame_support::debug::trace!(
+				"Message {:?}/{:?}: the call ({:?}) is rejected by filter",
+				bridge,
+				id,
+				call,
+			);
+			Self::deposit_event(RawEvent::MessageCallRejected(bridge, id));
+			return;
+		}
+
 		// verify weight
 		// (we want passed weight to be at least equal to pre-dispatch weight of the call
 		// because otherwise Calls may be dispatched at lower price)
-		let dispatch_info = message.call.get_dispatch_info();
+		let dispatch_info = call.get_dispatch_info();
 		let expected_weight = dispatch_info.weight;
 		if message.weight < expected_weight {
 			frame_support::debug::trace!(
@@ -192,35 +307,13 @@ impl<T: Trait<I>, I: Instance> MessageDispatch<T::MessageId> for Module<T, I> {
 			return;
 		}
 
-		// prepare dispatch origin
-		let origin_account = match message.origin {
-			CallOrigin::BridgeAccount => bridge_account_id(bridge, CALL_DISPATCH_MODULE_PREFIX),
-			CallOrigin::RealAccount(source_public, target_public, target_signature) => {
-				let mut signed_message = Vec::new();
-				message.call.encode_to(&mut signed_message);
-				source_public.encode_to(&mut signed_message);
-
-				let target_account = target_public.into_account();
-				if !target_signature.verify(&signed_message[..], &target_account) {
-					frame_support::debug::trace!(
-						"Message {:?}/{:?}: origin proof is invalid. Expected account: {:?} from signature: {:?}",
-						bridge,
-						id,
-						target_account,
-						target_signature,
-					);
-					Self::deposit_event(RawEvent::MessageSignatureMismatch(bridge, id));
-					return;
-				}
-
-				target_account
-			}
-		};
-
 		// finally dispatch message
 		let origin = RawOrigin::Signed(origin_account).into();
-		let dispatch_result = message.call.dispatch(origin);
+
+		frame_support::debug::trace!("Message being dispatched is: {:?}", &call);
+		let dispatch_result = call.dispatch(origin);
 		let actual_call_weight = extract_actual_weight(&dispatch_result, &dispatch_info);
+
 		frame_support::debug::trace!(
 			"Message {:?}/{:?} has been dispatched. Weight: {} of {}. Result: {:?}",
 			bridge,
@@ -238,55 +331,83 @@ impl<T: Trait<I>, I: Instance> MessageDispatch<T::MessageId> for Module<T, I> {
 	}
 }
 
-/// Verify payload of the message at the sending side.
-pub fn verify_sending_message<
-	ThisChainOuterOrigin,
-	ThisChainAccountId,
-	SourceChainAccountPublic,
-	TargetChainAccountPublic,
-	TargetChainSignature,
-	Call,
->(
-	sender_origin: ThisChainOuterOrigin,
-	message: &MessagePayload<TargetChainAccountPublic, SourceChainAccountPublic, TargetChainSignature, Call>,
-) -> Result<Option<ThisChainAccountId>, BadOrigin>
+/// Check if the message is allowed to be dispatched on the target chain given the sender's origin
+/// on the source chain.
+///
+/// For example, if a message is sent from a "regular" account on the source chain it will not be
+/// allowed to be dispatched as Root on the target chain. This is a useful check to do on the source
+/// chain _before_ sending a message whose dispatch will be rejected on the target chain.
+pub fn verify_message_origin<SourceChainAccountId, TargetChainAccountPublic, TargetChainSignature, Call>(
+	sender_origin: &RawOrigin<SourceChainAccountId>,
+	message: &MessagePayload<SourceChainAccountId, TargetChainAccountPublic, TargetChainSignature, Call>,
+) -> Result<Option<SourceChainAccountId>, BadOrigin>
 where
-	ThisChainOuterOrigin: Into<Result<RawOrigin<ThisChainAccountId>, ThisChainOuterOrigin>>,
-	TargetChainAccountPublic: Clone + IdentifyAccount<AccountId = ThisChainAccountId>,
-	ThisChainAccountId: PartialEq,
+	SourceChainAccountId: PartialEq + Clone,
 {
 	match message.origin {
-		CallOrigin::BridgeAccount => {
-			ensure_root(sender_origin)?;
+		CallOrigin::SourceRoot => {
+			ensure!(sender_origin == &RawOrigin::Root, BadOrigin);
 			Ok(None)
 		}
-		CallOrigin::RealAccount(ref this_account_public, _, _) => {
-			let this_chain_account_id = ensure_signed(sender_origin)?;
-			if this_chain_account_id != this_account_public.clone().into_account() {
-				return Err(BadOrigin);
-			}
-
-			Ok(Some(this_chain_account_id))
+		CallOrigin::TargetAccount(ref source_account_id, _, _) => {
+			ensure!(
+				sender_origin == &RawOrigin::Signed(source_account_id.clone()),
+				BadOrigin
+			);
+			Ok(Some(source_account_id.clone()))
+		}
+		CallOrigin::SourceAccount(ref source_account_id) => {
+			ensure!(
+				sender_origin == &RawOrigin::Signed(source_account_id.clone()),
+				BadOrigin
+			);
+			Ok(Some(source_account_id.clone()))
 		}
 	}
 }
 
+/// Target account ownership digest from the source chain.
+///
+/// The byte vector returned by this function will be signed with a target chain account
+/// private key. This way, the owner of `source_account_id` on the source chain proves that
+/// the target chain account private key is also under his control.
+pub fn account_ownership_digest<Call, AccountId, SpecVersion, BridgeId>(
+	call: &Call,
+	source_account_id: AccountId,
+	target_spec_version: SpecVersion,
+	source_instance_id: BridgeId,
+) -> Vec<u8>
+where
+	Call: Encode,
+	AccountId: Encode,
+	SpecVersion: Encode,
+	BridgeId: Encode,
+{
+	let mut proof = Vec::new();
+	call.encode_to(&mut proof);
+	source_account_id.encode_to(&mut proof);
+	target_spec_version.encode_to(&mut proof);
+	source_instance_id.encode_to(&mut proof);
+
+	proof
+}
+
 #[cfg(test)]
 mod tests {
+	// From construct_runtime macro
+	#![allow(clippy::from_over_into)]
+
 	use super::*;
-	use frame_support::{impl_outer_dispatch, impl_outer_event, impl_outer_origin, parameter_types, weights::Weight};
+	use frame_support::{parameter_types, weights::Weight};
 	use frame_system::{EventRecord, Phase};
 	use sp_core::H256;
 	use sp_runtime::{
 		testing::Header,
 		traits::{BlakeTwo256, IdentityLookup},
-		DispatchError, Perbill,
+		Perbill,
 	};
 
 	type AccountId = u64;
-	type CallDispatch = Module<TestRuntime>;
-	type System = frame_system::Module<TestRuntime>;
-
 	type MessageId = [u8; 4];
 
 	#[derive(Debug, Encode, Decode, Clone, PartialEq, Eq)]
@@ -311,28 +432,27 @@ mod tests {
 		}
 	}
 
-	#[derive(Clone, Eq, PartialEq)]
-	pub struct TestRuntime;
+	pub struct AccountIdConverter;
 
-	mod call_dispatch {
-		pub use crate::Event;
-	}
-
-	impl_outer_event! {
-		pub enum TestEvent for TestRuntime {
-			frame_system<T>,
-			call_dispatch<T>,
+	impl sp_runtime::traits::Convert<H256, AccountId> for AccountIdConverter {
+		fn convert(hash: H256) -> AccountId {
+			hash.to_low_u64_ne()
 		}
 	}
 
-	impl_outer_origin! {
-		pub enum Origin for TestRuntime where system = frame_system {}
-	}
+	type Block = frame_system::mocking::MockBlock<TestRuntime>;
+	type UncheckedExtrinsic = frame_system::mocking::MockUncheckedExtrinsic<TestRuntime>;
 
-	impl_outer_dispatch! {
-		pub enum Call for TestRuntime where origin: Origin {
-			frame_system::System,
-			call_dispatch::CallDispatch,
+	use crate as call_dispatch;
+
+	frame_support::construct_runtime! {
+		pub enum TestRuntime where
+			Block = Block,
+			NodeBlock = Block,
+			UncheckedExtrinsic = UncheckedExtrinsic,
+		{
+			System: frame_system::{Module, Call, Config, Storage, Event<T>},
+			CallDispatch: call_dispatch::{Module, Call, Event<T>},
 		}
 	}
 
@@ -343,7 +463,7 @@ mod tests {
 		pub const AvailableBlockRatio: Perbill = Perbill::one();
 	}
 
-	impl frame_system::Trait for TestRuntime {
+	impl frame_system::Config for TestRuntime {
 		type Origin = Origin;
 		type Index = u64;
 		type Call = Call;
@@ -353,31 +473,48 @@ mod tests {
 		type AccountId = AccountId;
 		type Lookup = IdentityLookup<Self::AccountId>;
 		type Header = Header;
-		type Event = TestEvent;
+		type Event = Event;
 		type BlockHashCount = BlockHashCount;
-		type MaximumBlockWeight = MaximumBlockWeight;
-		type DbWeight = ();
-		type BlockExecutionWeight = ();
-		type ExtrinsicBaseWeight = ();
-		type MaximumExtrinsicWeight = ();
-		type AvailableBlockRatio = AvailableBlockRatio;
-		type MaximumBlockLength = MaximumBlockLength;
 		type Version = ();
-		type PalletInfo = ();
+		type PalletInfo = PalletInfo;
 		type AccountData = ();
 		type OnNewAccount = ();
 		type OnKilledAccount = ();
 		type BaseCallFilter = ();
 		type SystemWeightInfo = ();
+		type BlockWeights = ();
+		type BlockLength = ();
+		type DbWeight = ();
+		type SS58Prefix = ();
 	}
 
-	impl Trait for TestRuntime {
-		type Event = TestEvent;
+	impl Config for TestRuntime {
+		type Event = Event;
 		type MessageId = MessageId;
-		type SourceChainAccountPublic = TestAccountPublic;
+		type SourceChainAccountId = AccountId;
 		type TargetChainAccountPublic = TestAccountPublic;
 		type TargetChainSignature = TestSignature;
 		type Call = Call;
+		type CallFilter = TestCallFilter;
+		type EncodedCall = EncodedCall;
+		type AccountIdConverter = AccountIdConverter;
+	}
+
+	#[derive(Decode, Encode)]
+	pub struct EncodedCall(Vec<u8>);
+
+	impl From<EncodedCall> for Result<Call, ()> {
+		fn from(call: EncodedCall) -> Result<Call, ()> {
+			Call::decode(&mut &call.0[..]).map_err(drop)
+		}
+	}
+
+	pub struct TestCallFilter;
+
+	impl Filter<Call> for TestCallFilter {
+		fn filter(call: &Call) -> bool {
+			!matches!(*call, Call::System(frame_system::Call::fill_block(_)))
+		}
 	}
 
 	const TEST_SPEC_VERSION: SpecVersion = 0;
@@ -390,56 +527,62 @@ mod tests {
 		sp_io::TestExternalities::new(t)
 	}
 
-	fn prepare_bridge_message(
+	fn prepare_message(
+		origin: CallOrigin<AccountId, TestAccountPublic, TestSignature>,
 		call: Call,
-	) -> <Module<TestRuntime> as MessageDispatch<<TestRuntime as Trait>::MessageId>>::Message {
+	) -> <Module<TestRuntime> as MessageDispatch<<TestRuntime as Config>::MessageId>>::Message {
 		MessagePayload {
 			spec_version: TEST_SPEC_VERSION,
 			weight: TEST_WEIGHT,
-			origin: CallOrigin::BridgeAccount,
-			call,
+			origin,
+			call: EncodedCall(call.encode()),
 		}
 	}
 
-	#[test]
-	fn should_succesfuly_dispatch_remark() {
-		new_test_ext().execute_with(|| {
-			let origin = b"ethb".to_owned();
-			let id = [0; 4];
-			let message =
-				prepare_bridge_message(Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])));
+	fn prepare_root_message(
+		call: Call,
+	) -> <Module<TestRuntime> as MessageDispatch<<TestRuntime as Config>::MessageId>>::Message {
+		prepare_message(CallOrigin::SourceRoot, call)
+	}
 
-			System::set_block_number(1);
-			CallDispatch::dispatch(origin, id, message);
+	fn prepare_target_message(
+		call: Call,
+	) -> <Module<TestRuntime> as MessageDispatch<<TestRuntime as Config>::MessageId>>::Message {
+		let origin = CallOrigin::TargetAccount(1, TestAccountPublic(1), TestSignature(1));
+		prepare_message(origin, call)
+	}
 
-			assert_eq!(
-				System::events(),
-				vec![EventRecord {
-					phase: Phase::Initialization,
-					event: TestEvent::call_dispatch(Event::<TestRuntime>::MessageDispatched(origin, id, Ok(()))),
-					topics: vec![],
-				}],
-			);
-		});
+	fn prepare_source_message(
+		call: Call,
+	) -> <Module<TestRuntime> as MessageDispatch<<TestRuntime as Config>::MessageId>>::Message {
+		let origin = CallOrigin::SourceAccount(1);
+		prepare_message(origin, call)
 	}
 
 	#[test]
 	fn should_fail_on_spec_version_mismatch() {
 		new_test_ext().execute_with(|| {
-			let origin = b"ethb".to_owned();
+			let bridge = b"ethb".to_owned();
 			let id = [0; 4];
+
+			const BAD_SPEC_VERSION: SpecVersion = 99;
 			let mut message =
-				prepare_bridge_message(Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])));
-			message.origin = CallOrigin::RealAccount(TestAccountPublic(2), TestAccountPublic(2), TestSignature(1));
+				prepare_root_message(Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])));
+			message.spec_version = BAD_SPEC_VERSION;
 
 			System::set_block_number(1);
-			CallDispatch::dispatch(origin, id, message);
+			CallDispatch::dispatch(bridge, id, Ok(message));
 
 			assert_eq!(
 				System::events(),
 				vec![EventRecord {
 					phase: Phase::Initialization,
-					event: TestEvent::call_dispatch(Event::<TestRuntime>::MessageSignatureMismatch(origin, id,)),
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageVersionSpecMismatch(
+						bridge,
+						id,
+						TEST_SPEC_VERSION,
+						BAD_SPEC_VERSION
+					)),
 					topics: vec![],
 				}],
 			);
@@ -449,21 +592,21 @@ mod tests {
 	#[test]
 	fn should_fail_on_weight_mismatch() {
 		new_test_ext().execute_with(|| {
-			let origin = b"ethb".to_owned();
+			let bridge = b"ethb".to_owned();
 			let id = [0; 4];
 			let mut message =
-				prepare_bridge_message(Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])));
+				prepare_root_message(Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])));
 			message.weight = 0;
 
 			System::set_block_number(1);
-			CallDispatch::dispatch(origin, id, message);
+			CallDispatch::dispatch(bridge, id, Ok(message));
 
 			assert_eq!(
 				System::events(),
 				vec![EventRecord {
 					phase: Phase::Initialization,
-					event: TestEvent::call_dispatch(Event::<TestRuntime>::MessageWeightMismatch(
-						origin, id, 1305000, 0,
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageWeightMismatch(
+						bridge, id, 1973000, 0,
 					)),
 					topics: vec![],
 				}],
@@ -474,21 +617,70 @@ mod tests {
 	#[test]
 	fn should_fail_on_signature_mismatch() {
 		new_test_ext().execute_with(|| {
-			let origin = b"ethb".to_owned();
+			let bridge = b"ethb".to_owned();
 			let id = [0; 4];
+
+			let call_origin = CallOrigin::TargetAccount(1, TestAccountPublic(1), TestSignature(99));
+			let message = prepare_message(
+				call_origin,
+				Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])),
+			);
+
+			System::set_block_number(1);
+			CallDispatch::dispatch(bridge, id, Ok(message));
+
+			assert_eq!(
+				System::events(),
+				vec![EventRecord {
+					phase: Phase::Initialization,
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageSignatureMismatch(
+						bridge, id
+					)),
+					topics: vec![],
+				}],
+			);
+		});
+	}
+
+	#[test]
+	fn should_emit_event_for_rejected_messages() {
+		new_test_ext().execute_with(|| {
+			let bridge = b"ethb".to_owned();
+			let id = [0; 4];
+
+			System::set_block_number(1);
+			CallDispatch::dispatch(bridge, id, Err(()));
+
+			assert_eq!(
+				System::events(),
+				vec![EventRecord {
+					phase: Phase::Initialization,
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageRejected(bridge, id)),
+					topics: vec![],
+				}],
+			);
+		});
+	}
+
+	#[test]
+	fn should_fail_on_call_decode() {
+		new_test_ext().execute_with(|| {
+			let bridge = b"ethb".to_owned();
+			let id = [0; 4];
+
 			let mut message =
-				prepare_bridge_message(Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])));
-			message.weight = 0;
+				prepare_root_message(Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])));
+			message.call.0 = vec![];
 
 			System::set_block_number(1);
-			CallDispatch::dispatch(origin, id, message);
+			CallDispatch::dispatch(bridge, id, Ok(message));
 
 			assert_eq!(
 				System::events(),
 				vec![EventRecord {
 					phase: Phase::Initialization,
-					event: TestEvent::call_dispatch(Event::<TestRuntime>::MessageWeightMismatch(
-						origin, id, 1305000, 0,
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageCallDecodeFailed(
+						bridge, id
 					)),
 					topics: vec![],
 				}],
@@ -497,25 +689,48 @@ mod tests {
 	}
 
 	#[test]
-	fn should_dispatch_bridge_message_from_non_root_origin() {
+	fn should_emit_event_for_rejected_calls() {
 		new_test_ext().execute_with(|| {
-			let origin = b"ethb".to_owned();
+			let bridge = b"ethb".to_owned();
 			let id = [0; 4];
-			let message = prepare_bridge_message(Call::System(<frame_system::Call<TestRuntime>>::fill_block(
-				Perbill::from_percent(10),
-			)));
+
+			let call = Call::System(<frame_system::Call<TestRuntime>>::fill_block(Perbill::from_percent(75)));
+			let weight = call.get_dispatch_info().weight;
+			let mut message = prepare_root_message(call);
+			message.weight = weight;
 
 			System::set_block_number(1);
-			CallDispatch::dispatch(origin, id, message);
+			CallDispatch::dispatch(bridge, id, Ok(message));
 
 			assert_eq!(
 				System::events(),
 				vec![EventRecord {
 					phase: Phase::Initialization,
-					event: TestEvent::call_dispatch(Event::<TestRuntime>::MessageDispatched(
-						origin,
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageCallRejected(bridge, id)),
+					topics: vec![],
+				}],
+			);
+		});
+	}
+
+	#[test]
+	fn should_dispatch_bridge_message_from_root_origin() {
+		new_test_ext().execute_with(|| {
+			let bridge = b"ethb".to_owned();
+			let id = [0; 4];
+			let message = prepare_root_message(Call::System(<frame_system::Call<TestRuntime>>::remark(vec![1, 2, 3])));
+
+			System::set_block_number(1);
+			CallDispatch::dispatch(bridge, id, Ok(message));
+
+			assert_eq!(
+				System::events(),
+				vec![EventRecord {
+					phase: Phase::Initialization,
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageDispatched(
+						bridge,
 						id,
-						Err(DispatchError::BadOrigin)
+						Ok(())
 					)),
 					topics: vec![],
 				}],
@@ -524,77 +739,120 @@ mod tests {
 	}
 
 	#[test]
-	fn dispatch_supports_different_accounts() {
-		fn dispatch_suicide(call_origin: CallOrigin<TestAccountPublic, TestAccountPublic, TestSignature>) {
-			let origin = b"ethb".to_owned();
+	fn should_dispatch_bridge_message_from_target_origin() {
+		new_test_ext().execute_with(|| {
 			let id = [0; 4];
-			let mut message = prepare_bridge_message(Call::System(<frame_system::Call<TestRuntime>>::suicide()));
-			message.origin = call_origin;
+			let bridge = b"ethb".to_owned();
+
+			let call = Call::System(<frame_system::Call<TestRuntime>>::remark(vec![]));
+			let message = prepare_target_message(call);
 
 			System::set_block_number(1);
-			CallDispatch::dispatch(origin, id, message);
-		}
+			CallDispatch::dispatch(bridge, id, Ok(message));
 
-		new_test_ext().execute_with(|| {
-			// 'create' real account
-			let real_account_id = 1;
-			System::inc_account_nonce(real_account_id);
-			// 'create' bridge account
-			let bridge_account_id: AccountId = bridge_account_id(*b"ethb", CALL_DISPATCH_MODULE_PREFIX);
-			System::inc_account_nonce(bridge_account_id);
-
-			assert_eq!(System::account_nonce(real_account_id), 1);
-			assert_eq!(System::account_nonce(bridge_account_id), 1);
-
-			// kill real account
-			dispatch_suicide(CallOrigin::RealAccount(
-				TestAccountPublic(real_account_id),
-				TestAccountPublic(real_account_id),
-				TestSignature(real_account_id),
-			));
-			assert_eq!(System::account_nonce(real_account_id), 0);
-			assert_eq!(System::account_nonce(bridge_account_id), 1);
-
-			// kill bridge account
-			dispatch_suicide(CallOrigin::BridgeAccount);
-			assert_eq!(System::account_nonce(real_account_id), 0);
-			assert_eq!(System::account_nonce(bridge_account_id), 0);
-		});
+			assert_eq!(
+				System::events(),
+				vec![EventRecord {
+					phase: Phase::Initialization,
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageDispatched(
+						bridge,
+						id,
+						Ok(())
+					)),
+					topics: vec![],
+				}],
+			);
+		})
 	}
 
 	#[test]
-	fn origin_is_checked_when_verify_sending_message() {
-		let mut message = prepare_bridge_message(Call::System(<frame_system::Call<TestRuntime>>::suicide()));
+	fn should_dispatch_bridge_message_from_source_origin() {
+		new_test_ext().execute_with(|| {
+			let id = [0; 4];
+			let bridge = b"ethb".to_owned();
 
-		// when message is sent by root, CallOrigin::BridgeAccount is allowed
+			let call = Call::System(<frame_system::Call<TestRuntime>>::remark(vec![]));
+			let message = prepare_source_message(call);
+
+			System::set_block_number(1);
+			CallDispatch::dispatch(bridge, id, Ok(message));
+
+			assert_eq!(
+				System::events(),
+				vec![EventRecord {
+					phase: Phase::Initialization,
+					event: Event::call_dispatch(call_dispatch::Event::<TestRuntime>::MessageDispatched(
+						bridge,
+						id,
+						Ok(())
+					)),
+					topics: vec![],
+				}],
+			);
+		})
+	}
+
+	#[test]
+	fn origin_is_checked_when_verifying_sending_message_using_source_root_account() {
+		let call = Call::System(<frame_system::Call<TestRuntime>>::remark(vec![]));
+		let message = prepare_root_message(call);
+
+		// When message is sent by Root, CallOrigin::SourceRoot is allowed
+		assert!(matches!(verify_message_origin(&RawOrigin::Root, &message), Ok(None)));
+
+		// when message is sent by some real account, CallOrigin::SourceRoot is not allowed
 		assert!(matches!(
-			verify_sending_message(Origin::from(RawOrigin::Root), &message),
-			Ok(None)
+			verify_message_origin(&RawOrigin::Signed(1), &message),
+			Err(BadOrigin)
 		));
+	}
 
-		// when message is sent by some real account, CallOrigin::BridgeAccount is not allowed
+	#[test]
+	fn origin_is_checked_when_verifying_sending_message_using_target_account() {
+		let call = Call::System(<frame_system::Call<TestRuntime>>::remark(vec![]));
+		let message = prepare_target_message(call);
+
+		// When message is sent by Root, CallOrigin::TargetAccount is not allowed
 		assert!(matches!(
-			verify_sending_message(Origin::from(RawOrigin::Signed(1)), &message),
+			verify_message_origin(&RawOrigin::Root, &message),
 			Err(BadOrigin)
 		));
 
-		// when message is sent by root, CallOrigin::RealAccount is not allowed
-		message.origin = CallOrigin::RealAccount(TestAccountPublic(2), TestAccountPublic(2), TestSignature(2));
+		// When message is sent by some other account, it is rejected
 		assert!(matches!(
-			verify_sending_message(Origin::from(RawOrigin::Root), &message),
+			verify_message_origin(&RawOrigin::Signed(2), &message),
 			Err(BadOrigin)
 		));
 
-		// when message is sent by some other account, it is rejected
+		// When message is sent by a real account, it is allowed to have origin
+		// CallOrigin::TargetAccount
 		assert!(matches!(
-			verify_sending_message(Origin::from(RawOrigin::Signed(1)), &message),
+			verify_message_origin(&RawOrigin::Signed(1), &message),
+			Ok(Some(1))
+		));
+	}
+
+	#[test]
+	fn origin_is_checked_when_verifying_sending_message_using_source_account() {
+		let call = Call::System(<frame_system::Call<TestRuntime>>::remark(vec![]));
+		let message = prepare_source_message(call);
+
+		// Sending a message from the expected origin account works
+		assert!(matches!(
+			verify_message_origin(&RawOrigin::Signed(1), &message),
+			Ok(Some(1))
+		));
+
+		// If we send a message from a different account, it is rejected
+		assert!(matches!(
+			verify_message_origin(&RawOrigin::Signed(2), &message),
 			Err(BadOrigin)
 		));
 
-		// when message is sent real account, it is allowed to have origin CallOrigin::RealAccount
+		// If we try and send the message from Root, it is also rejected
 		assert!(matches!(
-			verify_sending_message(Origin::from(RawOrigin::Signed(2)), &message),
-			Ok(Some(2))
+			verify_message_origin(&RawOrigin::Root, &message),
+			Err(BadOrigin)
 		));
 	}
 }
