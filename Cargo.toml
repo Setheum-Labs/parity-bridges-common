@@ -1,16 +1,11 @@
 [workspace]
+resolver = "2"
 
 members = [
-	"bin/millau/node",
-	"bin/rialto/node",
-	"bin/millau/runtime",
-	"bin/rialto/runtime",
-	"modules/call-dispatch",
-	"modules/substrate",
-	"modules/ethereum",
-	"modules/ethereum-contract/builtin",
-	"modules/finality-verifier",
-	"modules/currency-exchange",
-	"relays/ethereum",
-	"relays/substrate",
+	"bin/*/node",
+	"bin/*/runtime",
+	"fuzz/*",
+	"modules/*",
+	"primitives/*",
+	"relays/*",
 ]
